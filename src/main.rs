@@ -21,6 +21,7 @@ mod message;
 mod network;
 mod reply;
 mod send_task;
+mod session_udp;
 mod stress;
 mod theme_event_handler;
 mod theme_manager;
