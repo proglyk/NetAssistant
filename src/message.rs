@@ -23,6 +23,39 @@ impl fmt::Display for MessageDirection {
     }
 }
 
+/// 消息阶段标签（UDP 会话帧的处理环节）
+///
+/// 阶段对应 `docs-dev/pictures/udp-path.png` 里的环节：socket → decoder →
+/// session → handshake → sender。阶段名与颜色在 UI 层渲染，消息本身只带标签，
+/// 不带颜色，避免核心层依赖 gpui。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageStage {
+    /// udp:socket：收到数据报
+    Socket,
+    /// udp:decoder：帧解码与解密
+    Decoder,
+    /// udp:session：会话密钥与状态
+    Session,
+    /// udp:handshake：握手证明
+    Handshake,
+    /// udp:sender：发送
+    Sender,
+}
+
+impl MessageStage {
+    /// 阶段标签文本
+    pub fn tag(self) -> &'static str {
+        match self {
+            MessageStage::Socket => "udp:socket",
+            MessageStage::Decoder => "udp:decoder",
+            MessageStage::Session => "udp:session",
+            MessageStage::Handshake => "udp:handshake",
+            MessageStage::Sender => "udp:sender",
+        }
+    }
+}
+
 /// 消息类型（用于标识发送时的模式）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +127,8 @@ pub struct Message {
     pub topic: Option<String>,
     /// MQTT PUBLISH 的 retain 标记（消息列表 topic pill 旁小标记）；非 MQTT 恒 false
     pub retain: bool,
+    /// 阶段标签（UDP 会话日志行）；普通消息恒 None
+    pub stage: Option<MessageStage>,
     cached_content: String,
     /// 显示格式化缓存(惰性): Some((模式, 格式化后的内容))。
     /// 切换显示模式时不再全量重算(toggle 为 O(1)),渲染可见项时按需计算并填充。
@@ -128,6 +163,7 @@ impl Message {
             source_unexpected: false,
             topic: None,
             retain: false,
+            stage: None,
             cached_content,
             display_cache: Mutex::new(None),
         }
@@ -143,6 +179,15 @@ impl Message {
 
     pub fn with_source(mut self, source: String) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    /// 注入阶段标签（UDP 会话日志行）
+    ///
+    /// 带阶段的消息是协议事件的解读，不是用户数据：它不计入收发计数，
+    /// 也不随输入框的文本/十六进制模式切换显示格式。
+    pub fn with_stage(mut self, stage: MessageStage) -> Self {
+        self.stage = Some(stage);
         self
     }
 
@@ -235,6 +280,7 @@ impl Clone for Message {
             source_unexpected: self.source_unexpected,
             topic: self.topic.clone(),
             retain: self.retain,
+            stage: self.stage,
             cached_content: self.cached_content.clone(),
             display_cache: Mutex::new(None),
         }
@@ -362,9 +408,12 @@ impl MessageListState {
 
     /// 添加一条消息，返回被淘汰条数。
     pub fn add_message(&mut self, message: Message) -> usize {
-        match message.direction {
-            MessageDirection::Sent => self.total_sent += 1,
-            MessageDirection::Received => self.total_received += 1,
+        // 阶段消息是协议事件的解读，不是收发过的数据，不计入计数
+        if message.stage.is_none() {
+            match message.direction {
+                MessageDirection::Sent => self.total_sent += 1,
+                MessageDirection::Received => self.total_received += 1,
+            }
         }
         Arc::make_mut(&mut self.messages).push(message);
         self.evict_with_hysteresis()
@@ -377,9 +426,11 @@ impl MessageListState {
             return 0;
         }
         for message in &new_messages {
-            match message.direction {
-                MessageDirection::Sent => self.total_sent += 1,
-                MessageDirection::Received => self.total_received += 1,
+            if message.stage.is_none() {
+                match message.direction {
+                    MessageDirection::Sent => self.total_sent += 1,
+                    MessageDirection::Received => self.total_received += 1,
+                }
             }
         }
         let messages = Arc::make_mut(&mut self.messages);
@@ -411,7 +462,7 @@ impl MessageListState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, MessageDirection, MessageListState, MessageType};
+    use super::{Message, MessageDirection, MessageListState, MessageStage, MessageType};
     use std::sync::Arc;
 
     #[test]
@@ -460,6 +511,39 @@ mod tests {
         let clone = message.clone();
         assert_eq!(clone.topic.as_deref(), Some("sensor/1"));
         assert!(clone.retain);
+    }
+
+    #[test]
+    fn test_message_stage_is_none_by_default() {
+        // 普通消息没有阶段标签，既有构造点语义不变
+        let message = Message::new(MessageDirection::Received, b"x".to_vec(), MessageType::Text);
+        assert_eq!(message.stage, None);
+    }
+
+    #[test]
+    fn test_message_with_stage_sets_the_tag() {
+        let message = Message::new(MessageDirection::Sent, b"x".to_vec(), MessageType::Text)
+            .with_stage(MessageStage::Sender);
+        assert_eq!(message.stage, Some(MessageStage::Sender));
+        assert_eq!(message.stage.unwrap().tag(), "udp:sender");
+
+        // clone 保留阶段标签（日志/导出路径）
+        let clone = message.clone();
+        assert_eq!(clone.stage, Some(MessageStage::Sender));
+    }
+
+    #[test]
+    fn test_stage_messages_are_not_counted() {
+        // 阶段消息是协议事件的解读，不是收发过的数据：不计入计数
+        let mut list = MessageListState::new();
+        list.add_message(
+            Message::new(MessageDirection::Sent, b"a".to_vec(), MessageType::Text)
+                .with_stage(MessageStage::Sender),
+        );
+        assert_eq!(list.total_sent, 0);
+        assert_eq!(list.total_received, 0);
+        assert_eq!(list.total_messages(), 0);
+        assert_eq!(list.messages.len(), 1);
     }
 
     #[test]
