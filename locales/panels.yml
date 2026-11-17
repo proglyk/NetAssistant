@@ -972,12 +972,24 @@ udp_session:
   warn_foreign_session:
     zh-CN: 收到其他会话的报文
     en: Packet from another session
+  warn_bad_nonce:
+    zh-CN: 随机数与报文头不符，报文已丢弃
+    en: Nonce does not match the header; packet dropped
+  warn_timestamp_out_of_window:
+    zh-CN: 时间戳超出 300 秒窗口，报文已丢弃
+    en: Timestamp outside the 300 s window; packet dropped
   warn_bad_tag:
     zh-CN: 解密失败，报文已丢弃
     en: Decrypt failed; packet dropped
   warn_bad_seq:
     zh-CN: 序号不匹配，报文已丢弃
     en: Sequence mismatch; packet dropped
+  warn_payload_too_large:
+    zh-CN: 消息过长，未发送
+    en: Message too long; not sent
+  warn_random_failed:
+    zh-CN: 无法生成随机数，消息未发送
+    en: Cannot generate random bytes; message not sent
   warn_unexpected_packet:
     zh-CN: 收到意外的会话报文
     en: Unexpected session packet
@@ -987,6 +999,24 @@ udp_session:
   warn_too_long:
     zh-CN: 报文超过 1400 字节，已丢弃
     en: Datagram longer than 1400 bytes dropped
+  close_user_disconnect:
+    zh-CN: 设备结束了会话：用户断开
+    en: "Device closed the session: user disconnected"
+  close_timeout:
+    zh-CN: 设备结束了会话：超时
+    en: "Device closed the session: timeout"
+  close_secret_rotated:
+    zh-CN: 设备结束了会话：密钥已轮换
+    en: "Device closed the session: secret rotated"
+  close_error:
+    zh-CN: 设备结束了会话：错误
+    en: "Device closed the session: error"
+  close_unknown:
+    zh-CN: 设备结束了会话：%{reason}
+    en: "Device closed the session: %{reason}"
+  close_unknown_reason:
+    zh-CN: 设备结束了会话：原因未知
+    en: "Device closed the session: unknown reason"
   hint_waiting:
     zh-CN: 正在握手
     en: Handshake in progress
