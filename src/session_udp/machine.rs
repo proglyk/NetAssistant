@@ -1538,4 +1538,22 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn a_push_body_is_not_parsed_as_a_reply() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // The body of a push looks like an answer, but a push is not one.
+        let plain = ack_envelope(Some("cmd-1"), "applied");
+        let frame = device_frame(PacketType::Push, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == &plain))
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Reply(_))),
+            "the body of a push is not parsed"
+        );
+    }
 }
