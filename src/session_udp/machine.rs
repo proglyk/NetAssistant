@@ -9,7 +9,7 @@ use crate::session_udp::codec::{
     session_ok_mac_input,
 };
 use crate::session_udp::crypto::{
-    TAG_LEN, aes_gcm_decrypt, aes_gcm_encrypt, hmac_sha256, hmac_verify, hkdf_sha256,
+    TAG_LEN, aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
 };
 use std::fmt;
 
@@ -79,9 +79,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn new() -> Self {
-        Machine {
-            state: State::Idle,
-        }
+        Machine { state: State::Idle }
     }
 
     /// 处理一条输入，返回状态机的动作列表
@@ -139,7 +137,9 @@ impl Machine {
     /// 握手超时：重发同一个 Hello；次数用尽则失败
     fn on_tick(&mut self) -> Vec<Action> {
         let (tries_left, hello) = match &self.state {
-            State::Wait { tries_left, hello, .. } => (*tries_left, hello.clone()),
+            State::Wait {
+                tries_left, hello, ..
+            } => (*tries_left, hello.clone()),
             _ => return Vec::new(),
         };
         if tries_left == 0 {
@@ -275,7 +275,9 @@ impl Machine {
                     ),
                 }
             }
-            Packet::Close { session_id: sid, .. } => {
+            Packet::Close {
+                session_id: sid, ..
+            } => {
                 if sid == session_id {
                     // Close 不加密也不认证；它的 seq 不参与校验
                     (State::Closed, vec![Action::Closed])
@@ -293,12 +295,7 @@ impl Machine {
         }
     }
 
-    fn established_state(
-        session_id: [u8; 16],
-        key: [u8; 32],
-        tx_seq: u64,
-        rx_seq: u64,
-    ) -> State {
+    fn established_state(session_id: [u8; 16], key: [u8; 32], tx_seq: u64, rx_seq: u64) -> State {
         State::Established {
             session_id,
             key,
@@ -408,8 +405,8 @@ impl fmt::Debug for Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_udp::codec::{Packet, data_aad, data_nonce, hello_mac_input};
-    use crate::session_udp::crypto::{aes_gcm_encrypt, hmac_sha256, hkdf_sha256, TAG_LEN};
+    use crate::session_udp::codec::{Packet, data_aad, data_nonce};
+    use crate::session_udp::crypto::{TAG_LEN, aes_gcm_encrypt, hkdf_sha256, hmac_sha256};
 
     const PSK: &str = "super-secret-psk";
     fn nonce_a() -> [u8; 16] {
@@ -457,7 +454,11 @@ mod tests {
         let hello = hello_of(&start(m, 3));
         let ok = session_ok_for(&hello);
         let actions = m.handle(Command::Packet(ok));
-        assert!(actions.iter().any(|a| matches!(a, Action::Established { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Established { .. }))
+        );
         [3u8; 16]
     }
 
@@ -477,7 +478,11 @@ mod tests {
         };
         assert_eq!(*seq, 1);
         assert_eq!(*sid, session_id);
-        let key = hkdf_sha256(PSK.as_bytes(), &salt(), crate::session_udp::codec::HKDF_INFO);
+        let key = hkdf_sha256(
+            PSK.as_bytes(),
+            &salt(),
+            crate::session_udp::codec::HKDF_INFO,
+        );
         let plain = crate::session_udp::crypto::aes_gcm_decrypt(
             &key,
             &data_nonce(&session_id, 1),
@@ -499,9 +504,11 @@ mod tests {
             seq: 1,
             ciphertext: ct,
         }));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Deliver(p) if p == b"{\"a\":1}")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"{\"a\":1}"))
+        );
     }
 
     #[test]
@@ -513,9 +520,11 @@ mod tests {
             assert_eq!(first, again);
         }
         let failed = m.handle(Command::Tick);
-        assert!(failed
-            .iter()
-            .any(|a| matches!(a, Action::Failed(s) if s == "handshake timeout")));
+        assert!(
+            failed
+                .iter()
+                .any(|a| matches!(a, Action::Failed(s) if s == "handshake timeout"))
+        );
         assert!(!format!("{failed:?}").contains(PSK));
     }
 
@@ -565,7 +574,11 @@ mod tests {
     fn replay_and_gap_warn_then_next_seq_delivers() {
         let mut m = Machine::new();
         let session_id = establish(&mut m);
-        let key = hkdf_sha256(PSK.as_bytes(), &salt(), crate::session_udp::codec::HKDF_INFO);
+        let key = hkdf_sha256(
+            PSK.as_bytes(),
+            &salt(),
+            crate::session_udp::codec::HKDF_INFO,
+        );
         let seal = |seq: u64, plain: &[u8]| {
             aes_gcm_encrypt(
                 &key,
@@ -592,7 +605,10 @@ mod tests {
             seq: 1,
             ciphertext: seal(1, b"a"),
         }));
-        assert!(ok.iter().any(|a| matches!(a, Action::Deliver(p) if p == b"a")));
+        assert!(
+            ok.iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"a"))
+        );
     }
 
     #[test]
@@ -604,7 +620,10 @@ mod tests {
             seq: 1,
         }));
         assert!(matches!(&foreign[..], [Action::Warn(t)] if t == "foreign session"));
-        let closed = m.handle(Command::Packet(Packet::Close { session_id, seq: 99 }));
+        let closed = m.handle(Command::Packet(Packet::Close {
+            session_id,
+            seq: 99,
+        }));
         assert!(matches!(&closed[..], [Action::Closed]));
         assert!(!closed.iter().any(|a| matches!(a, Action::Send(_))));
     }
@@ -615,7 +634,10 @@ mod tests {
         let _ = establish(&mut m);
         assert!(m.handle(Command::UserBytes(vec![])).is_empty());
         let actions = m.handle(Command::UserBytes(b"a".to_vec()));
-        assert!(matches!(&actions[0], Action::Send(Packet::Data { seq: 1, .. })));
+        assert!(matches!(
+            &actions[0],
+            Action::Send(Packet::Data { seq: 1, .. })
+        ));
     }
 
     #[test]
@@ -635,13 +657,14 @@ mod tests {
     fn second_start_ignored_and_bytes_before_established_not_sent() {
         let mut m = Machine::new();
         let _ = establish(&mut m);
-        assert!(m
-            .handle(Command::Start {
+        assert!(
+            m.handle(Command::Start {
                 nonce_a: nonce_a(),
                 psk: PSK.into(),
                 hello_retries: 3,
             })
-            .is_empty());
+            .is_empty()
+        );
 
         let mut early = Machine::new();
         let _ = start(&mut early, 3);

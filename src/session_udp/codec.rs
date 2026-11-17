@@ -41,7 +41,10 @@ const MAX_SESSION_ERR_MSG: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
     /// 客户端握手首包：`nonce_a` + `proof_a`
-    Hello { nonce_a: [u8; ID_LEN], proof_a: [u8; PROOF_LEN] },
+    Hello {
+        nonce_a: [u8; ID_LEN],
+        proof_a: [u8; PROOF_LEN],
+    },
     /// 服务端握手应答：`session_id` + `nonce_b` + `proof_b`
     SessionOk {
         session_id: [u8; ID_LEN],
@@ -273,7 +276,10 @@ pub fn hello_mac_input(nonce_a: &[u8; ID_LEN]) -> [u8; HEADER_LEN + ID_LEN] {
 }
 
 /// SessionOk 的 HMAC 覆盖范围：magic + version + type + session_id + nonce_b（不含 proof）
-pub fn session_ok_mac_input(session_id: &[u8; ID_LEN], nonce_b: &[u8; ID_LEN]) -> [u8; HEADER_LEN + ID_LEN * 2] {
+pub fn session_ok_mac_input(
+    session_id: &[u8; ID_LEN],
+    nonce_b: &[u8; ID_LEN],
+) -> [u8; HEADER_LEN + ID_LEN * 2] {
     let mut out = [0u8; HEADER_LEN + ID_LEN * 2];
     out[..HEADER_LEN].copy_from_slice(&header(TYPE_SESSION_OK));
     out[HEADER_LEN..HEADER_LEN + ID_LEN].copy_from_slice(session_id);
@@ -290,7 +296,11 @@ pub fn data_nonce(session_id: &[u8; ID_LEN], seq: u64) -> [u8; NONCE_LEN] {
 }
 
 /// DATA 的 AAD：DATA 帧在密文之前的全部字节（含 cipher_len）
-pub fn data_aad(session_id: &[u8; ID_LEN], seq: u64, cipher_len: u16) -> [u8; HEADER_LEN + ID_LEN + 8 + 2] {
+pub fn data_aad(
+    session_id: &[u8; ID_LEN],
+    seq: u64,
+    cipher_len: u16,
+) -> [u8; HEADER_LEN + ID_LEN + 8 + 2] {
     let mut out = [0u8; HEADER_LEN + ID_LEN + 8 + 2];
     out[..HEADER_LEN].copy_from_slice(&header(TYPE_DATA));
     out[HEADER_LEN..HEADER_LEN + ID_LEN].copy_from_slice(session_id);
@@ -411,10 +421,7 @@ mod tests {
             ciphertext: vec![0u8; 17],
         });
         bytes[28..30].copy_from_slice(&16u16.to_be_bytes());
-        assert!(
-            decode(&bytes).is_err(),
-            "cipher_len меньше хвоста — не Ok"
-        );
+        assert!(decode(&bytes).is_err(), "cipher_len меньше хвоста — не Ok");
         let mut short_tag = encode(&Packet::Data {
             session_id: [9u8; 16],
             seq: 1,
