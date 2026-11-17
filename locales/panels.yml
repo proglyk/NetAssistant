@@ -945,6 +945,21 @@ udp_session:
   err_session:
     zh-CN: 会话错误 %{detail}
     en: Session error %{detail}
+  err_auth_failed:
+    zh-CN: 认证失败，共享密钥不正确
+    en: "Authentication failed: wrong shared secret"
+  err_max_sessions:
+    zh-CN: 设备的所有会话都被占用
+    en: All device sessions are busy
+  err_not_bound:
+    zh-CN: 设备未配网
+    en: Device is not bound
+  err_rate_limited:
+    zh-CN: 尝试过于频繁，请稍后再试
+    en: Too many attempts; try again later
+  err_version_mismatch:
+    zh-CN: 协议版本不匹配
+    en: Protocol version mismatch
   err_seq_exhausted:
     zh-CN: 发送序号已用尽
     en: Send sequence exhausted
@@ -970,8 +985,8 @@ udp_session:
     zh-CN: 报文无法解析，已丢弃
     en: Datagram rejected
   warn_too_long:
-    zh-CN: 报文超过 2048 字节，已丢弃
-    en: Datagram longer than 2048 bytes dropped
+    zh-CN: 报文超过 1400 字节，已丢弃
+    en: Datagram longer than 1400 bytes dropped
   hint_waiting:
     zh-CN: 正在握手
     en: Handshake in progress
