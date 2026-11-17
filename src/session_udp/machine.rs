@@ -1,8 +1,8 @@
-//! UDP Session 握手状态机。
+//! UDP Session handshake state machine.
 //!
-//! 纯逻辑模块：不引 gpui，不引 tokio，也不自己取时间与随机数。
-//! 时间由外部计时器推进（`Command::Tick`），随机 nonce 由外部给（`Command::Start`），
-//! 因此整台状态机是确定性的，可脚本化测试。
+//! Pure logic module: it imports neither gpui nor tokio and does not get the time or the random bytes on its own.
+//! The time is advanced by an external timer (`Command::Tick`), the random nonce comes from outside (`Command::Start`),
+//! therefore the whole state machine is deterministic and can be tested by a script.
 
 use crate::session_udp::codec::{
     DecodeError, HKDF_INFO, Packet, data_aad, data_nonce, decode, hello_mac_input,
@@ -13,55 +13,55 @@ use crate::session_udp::crypto::{
 };
 use std::fmt;
 
-/// 状态机输入
+/// Input of the state machine
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// 开始握手：客户端随机 nonce、预共享密钥、HELLO 重发次数
+    /// Start the handshake: the client nonce, the pre-shared secret, the number of HELLO resends
     Start {
         nonce_a: [u8; 16],
         psk: String,
         hello_retries: u8,
     },
-    /// 握手超时（由外部计时器触发）
+    /// Handshake timeout (triggered by an external timer)
     Tick,
-    /// 收到一个已解析的协议包
+    /// A parsed protocol packet has arrived
     Packet(Packet),
-    /// 用户发送的字节
+    /// Bytes sent by the user
     UserBytes(Vec<u8>),
-    /// 用户主动断开
+    /// The user disconnects on purpose
     UserDisconnect,
 }
 
-/// 状态机输出
+/// Output of the state machine
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// 需要发出的协议包
+    /// A protocol packet that has to be sent
     Send(Packet),
-    /// 解密后的明文载荷
+    /// The decrypted plain text payload
     Deliver(Vec<u8>),
-    /// 握手完成，会话建立
+    /// The handshake is over, the session is established
     Established { session_id: [u8; 16] },
-    /// 致命失败：连接终止
+    /// Fatal failure: the connection ends
     Failed(String),
-    /// 会话关闭
+    /// The session is closed
     Closed,
-    /// 非致命告警：连接保持
+    /// Non-fatal warning: the connection stays
     Warn(String),
 }
 
-/// 内部状态
+/// Internal state
 enum State {
     Idle,
-    /// 等待 SessionOk
+    /// Waiting for the SessionOk
     Wait {
         nonce_a: [u8; 16],
         psk: String,
         tries_left: u8,
-        /// 已发出的 Hello 原样保存：重发必须带同一个 nonce 与 proof，
-        /// 换 nonce 会让服务端开出并行握手
+        /// The sent Hello is kept as it is: a resend must carry the same nonce and the same proof,
+        /// another nonce would let the server open a parallel handshake
         hello: Packet,
     },
-    /// 会话已建立
+    /// The session is established
     Established {
         session_id: [u8; 16],
         key: [u8; 32],
@@ -72,7 +72,7 @@ enum State {
     Failed,
 }
 
-/// UDP Session 握手状态机
+/// UDP Session handshake state machine
 pub struct Machine {
     state: State,
 }
@@ -82,7 +82,7 @@ impl Machine {
         Machine { state: State::Idle }
     }
 
-    /// 处理一条输入，返回状态机的动作列表
+    /// Process one input and return the list of actions of the state machine
     pub fn handle(&mut self, cmd: Command) -> Vec<Action> {
         match cmd {
             Command::Start {
@@ -97,7 +97,7 @@ impl Machine {
         }
     }
 
-    /// 处理一个收到的数据报：先解析，解析失败按状态决定是失败还是静默丢弃
+    /// Process a received datagram: parse it first, and on a parse failure decide from the state whether to fail or to drop it silently
     pub fn on_datagram(&mut self, bytes: &[u8]) -> Vec<Action> {
         match decode(bytes) {
             Ok(packet) => self.handle(Command::Packet(packet)),
@@ -113,12 +113,12 @@ impl Machine {
         }
     }
 
-    /// 开始握手：只在 Idle 生效
+    /// Start the handshake: it only works in the Idle state
     fn on_start(&mut self, nonce_a: [u8; 16], psk: String, hello_retries: u8) -> Vec<Action> {
         if !matches!(&self.state, State::Idle) {
             return Vec::new();
         }
-        // 空 PSK 不是合法密钥：直接失败，一个字节都不上线
+        // An empty PSK is not a valid key: fail right away, not a single byte goes on the wire
         if psk.is_empty() {
             self.state = State::Failed;
             return vec![Action::Failed("empty psk".to_string())];
@@ -134,7 +134,7 @@ impl Machine {
         vec![Action::Send(hello)]
     }
 
-    /// 握手超时：重发同一个 Hello；次数用尽则失败
+    /// Handshake timeout: resend the same Hello; when the attempts are used up it fails
     fn on_tick(&mut self) -> Vec<Action> {
         let (tries_left, hello) = match &self.state {
             State::Wait {
@@ -152,9 +152,9 @@ impl Machine {
         vec![Action::Send(hello)]
     }
 
-    /// 收到协议包：按当前状态分派
+    /// A protocol packet has arrived: dispatch it by the current state
     fn on_packet(&mut self, packet: Packet) -> Vec<Action> {
-        // 先把状态取出来，算完再放回去：处理函数需要改写状态
+        // Take the state out first and put it back after the computation: the handler has to rewrite the state
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Wait {
                 nonce_a,
@@ -184,7 +184,7 @@ impl Machine {
         }
     }
 
-    /// 等待期的包处理
+    /// Packet handling during the wait
     fn wait_packet(
         packet: Packet,
         nonce_a: [u8; 16],
@@ -202,7 +202,7 @@ impl Machine {
                 if !hmac_verify(psk.as_bytes(), &mac, &proof_b) {
                     return (State::Failed, vec![Action::Failed("bad proof".to_string())]);
                 }
-                // salt = nonce_a || nonce_b；info 固定；OKM 就是 AES-256 密钥
+                // salt = nonce_a || nonce_b; the info is fixed; the OKM is the AES-256 key
                 let mut salt = Vec::with_capacity(nonce_a.len() + nonce_b.len());
                 salt.extend_from_slice(&nonce_a);
                 salt.extend_from_slice(&nonce_b);
@@ -221,7 +221,7 @@ impl Machine {
                 State::Failed,
                 vec![Action::Failed(format!("session err {code}: {message}"))],
             ),
-            // 其余包（Hello / Data / Close）在等待期只是路过的数据报，静默忽略
+            // The other packets (Hello / Data / Close) are only passing datagrams during the wait, they are ignored silently
             _ => (
                 State::Wait {
                     nonce_a,
@@ -234,7 +234,7 @@ impl Machine {
         }
     }
 
-    /// 建立后的包处理
+    /// Packet handling after the session is established
     fn established_packet(
         packet: Packet,
         session_id: [u8; 16],
@@ -248,8 +248,8 @@ impl Machine {
                 seq,
                 ciphertext,
             } => {
-                // 先比 session_id，再比 seq，最后才解密：
-                // 别人的包与错序的包不能被"坏标签"掩盖成同一类错误
+                // First the session_id, then the seq, and only then the decryption:
+                // the packets of others and the out-of-order packets must not be hidden behind a "bad tag" as one single error
                 if sid != session_id {
                     return (
                         Self::established_state(session_id, key, tx_seq, rx_seq),
@@ -279,7 +279,7 @@ impl Machine {
                 session_id: sid, ..
             } => {
                 if sid == session_id {
-                    // Close 不加密也不认证；它的 seq 不参与校验
+                    // The Close is neither encrypted nor authenticated; its seq takes no part in the check
                     (State::Closed, vec![Action::Closed])
                 } else {
                     (
@@ -304,7 +304,7 @@ impl Machine {
         }
     }
 
-    /// 用户发送：建立之前一律拒绝（明文不能上线）
+    /// The user sends: before the session is established it is always refused (the plain text must not go on the wire)
     fn on_user_bytes(&mut self, bytes: Vec<u8>) -> Vec<Action> {
         let (session_id, key, tx_seq) = match &self.state {
             State::Established {
@@ -315,11 +315,11 @@ impl Machine {
             } => (*session_id, *key, *tx_seq),
             _ => return vec![Action::Warn("not established".to_string())],
         };
-        // 空载荷不占序号
+        // An empty payload does not spend a sequence number
         if bytes.is_empty() {
             return Vec::new();
         }
-        // 序号用尽：不再加密，编号也不上线
+        // The sequence number is exhausted: nothing is encrypted any more and the number does not go on the wire
         if tx_seq == u64::MAX {
             self.state = State::Failed;
             return vec![Action::Failed("seq exhausted".to_string())];
@@ -328,9 +328,10 @@ impl Machine {
         let cipher_len = (bytes.len() + TAG_LEN) as u16;
         let nonce = data_nonce(&session_id, tx_seq);
         let aad = data_aad(&session_id, tx_seq, cipher_len);
-        // 密钥与 nonce 长度固定，加密失败只可能是实现缺陷
-        let ciphertext = aes_gcm_encrypt(&key, &nonce, &aad, &bytes)
-            .expect("AES-256-GCM 密钥与 nonce 长度固定，加密不会失败");
+        // The key and the nonce have a fixed length, a failed encryption can only be a defect of the implementation
+        let ciphertext = aes_gcm_encrypt(&key, &nonce, &aad, &bytes).expect(
+            "the key and the nonce have a fixed length, the AES-256-GCM encryption cannot fail",
+        );
         if let State::Established { tx_seq, .. } = &mut self.state {
             *tx_seq += 1;
         }
@@ -341,7 +342,7 @@ impl Machine {
         })]
     }
 
-    /// 用户断开：已建立则发 Close（不加密），未建立则无从发包
+    /// The user disconnects: when the session is established a Close is sent (unencrypted), otherwise there is no packet to send
     fn on_user_disconnect(&mut self) -> Vec<Action> {
         let (state, actions) = match std::mem::replace(&mut self.state, State::Idle) {
             State::Established {
@@ -363,7 +364,7 @@ impl Machine {
         actions
     }
 
-    /// 已建立会话里的坏数据报：告警但不改变状态
+    /// A bad datagram in an established session: a warning, but the state does not change
     fn warn_bad_datagram(&self) -> Vec<Action> {
         if matches!(&self.state, State::Established { .. }) {
             vec![Action::Warn("bad datagram".to_string())]
@@ -372,7 +373,7 @@ impl Machine {
         }
     }
 
-    /// 测试用：把发送序号直接推到某个值（只在已建立时生效）
+    /// For the tests: push the outgoing sequence number to a value (only in the established state)
     #[cfg(test)]
     fn test_set_tx_seq(&mut self, seq: u64) {
         if let State::Established { tx_seq, .. } = &mut self.state {
@@ -388,7 +389,7 @@ impl Default for Machine {
 }
 
 impl fmt::Debug for Machine {
-    /// 只打印状态名与序号：psk、密钥、nonce、proof 都不进日志
+    /// Print the state name and the sequence numbers only: the psk, the key, the nonce and the proof never reach the log
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.state {
             State::Idle => write!(f, "Machine(Idle)"),
@@ -413,7 +414,7 @@ mod tests {
         [7u8; 16]
     }
 
-    /// HKDF 的 salt = nonce_a || nonce_b
+    /// HKDF salt = nonce_a || nonce_b
     fn salt() -> Vec<u8> {
         nonce_a().into_iter().chain([4u8; 16]).collect()
     }
@@ -563,7 +564,7 @@ mod tests {
             code: 1,
             message: "a".into(),
         });
-        // 附录 A: SessionErr = code u16 + len u16 + 消息，消息首字节在偏移 8
+        // Appendix A: SessionErr = code u16 + len u16 + message, the first byte of the message is at offset 8
         raw[8] = 0xFF;
         let actions = m.on_datagram(&raw);
         assert!(matches!(&actions[..], [Action::Failed(t)] if t == "bad session err"));
@@ -644,9 +645,9 @@ mod tests {
     fn seq_max_fails_without_data() {
         let mut m = Machine::new();
         let _ = establish(&mut m);
-        // довести tx_seq до MAX нельзя циклом за вменяемое время: тест зовёт
-        // crate-visible способ выставить следующий seq. Добавить
-        // #[cfg(test)] pub fn test_set_tx_seq(&mut self, seq: u64) только в Established.
+        // tx_seq cannot be driven to MAX in a loop in a reasonable time: the test
+        // calls the crate-visible way to set the next seq. Add
+        // #[cfg(test)] pub fn test_set_tx_seq(&mut self, seq: u64) only in Established.
         m.test_set_tx_seq(u64::MAX);
         let actions = m.handle(Command::UserBytes(b"a".to_vec()));
         assert!(matches!(&actions[..], [Action::Failed(t)] if t == "seq exhausted"));
