@@ -2,18 +2,26 @@
 //!
 //! Pure logic module: no gpui, no tokio, and no clock or random source of its
 //! own. Time arrives from outside (`now`, Unix seconds) and so do the random
-//! bytes (the 32-byte handshake nonce). The whole machine is therefore
-//! deterministic and testable without a network.
+//! bytes (the 32-byte handshake nonce and the 5-byte nonce tail). The whole
+//! machine is therefore deterministic and testable without a network.
 //!
 //! Handshake (protocol §5.4, spec B):
 //! `HELLO` → `CHALLENGE` → `RESPONSE` → `SESSION_OK`, or `SESSION_ERR`.
+//! Session (spec C): encrypted `DATA`, `PUSH` and `CLOSE`.
 
 use crate::session_udp::codec::{
-    Body, Frame, HANDSHAKE_NONCE_LEN, HKDF_INFO, Header, PacketType, decode, proof_a_input,
-    proof_b_input,
+    Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, Frame, HANDSHAKE_NONCE_LEN, HKDF_INFO,
+    Header, MAX_PLAINTEXT, PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes,
+    nonce_matches, proof_a_input, proof_b_input,
 };
-use crate::session_udp::crypto::{hkdf_sha256, hmac_sha256, hmac_verify};
+use crate::session_udp::crypto::{
+    aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
+};
 use std::fmt;
+
+/// Body of the outgoing `CLOSE`: the client only closes on an explicit
+/// disconnect, and the reason says so (protocol §5.9).
+const CLOSE_BODY_USER_DISCONNECT: &[u8] = br#"{"reason":"user_disconnect"}"#;
 
 /// State machine input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +39,18 @@ pub enum Command {
     Tick,
     /// A frame that arrived.
     Packet(Frame),
+    /// Bytes the user wants to send.
+    UserBytes {
+        /// Payload; it goes into the body of a `DATA` frame as it is.
+        bytes: Vec<u8>,
+        /// Five random bytes for the tail of the nonce.
+        nonce_tail: [u8; 5],
+    },
+    /// The user disconnected.
+    UserDisconnect {
+        /// Five random bytes for the tail of the nonce.
+        nonce_tail: [u8; 5],
+    },
 }
 
 /// State machine output.
@@ -38,6 +58,8 @@ pub enum Command {
 pub enum Action {
     /// A frame that has to go out.
     Send(Frame),
+    /// Decrypted plaintext.
+    Deliver(Vec<u8>),
     /// The handshake is over, the session is open.
     Established {
         /// Session id of the open session.
@@ -45,6 +67,13 @@ pub enum Action {
     },
     /// Fatal failure: the connection ends.
     Failed(String),
+    /// The session is closed. The reason is set when the peer closed it.
+    Closed {
+        /// Reason from the peer, `None` when the client closed the session.
+        reason: Option<String>,
+    },
+    /// Non-fatal warning: the session stays alive.
+    Warn(String),
 }
 
 /// Internal state.
@@ -65,13 +94,14 @@ enum State {
     Established {
         /// Session id of the open session.
         session_id: u16,
-        /// Session key. The encrypted frames of part C need it, so it is
-        /// derived already here (spec B, §9).
-        #[allow(dead_code)]
+        /// Session key.
         key: [u8; 32],
-        /// Sequence number of the next outgoing frame (spec B, §9).
+        /// Sequence number of the next outgoing frame.
         tx_seq: u32,
+        /// Sequence number of the last accepted frame.
+        rx_seq: Option<u32>,
     },
+    Closed,
     Failed,
 }
 
@@ -89,7 +119,7 @@ impl Machine {
     /// Handle one input and return the actions it produced.
     ///
     /// `now` is the Unix second the client clock reads; it fills the timestamp
-    /// of outgoing frames.
+    /// of outgoing frames and bounds the replay window of incoming ones.
     pub fn handle(&mut self, cmd: Command, now: u32) -> Vec<Action> {
         match cmd {
             Command::Start {
@@ -99,6 +129,8 @@ impl Machine {
             } => self.on_start(nonce_a, psk, hello_retries, now),
             Command::Tick => self.on_tick(now),
             Command::Packet(frame) => self.on_packet(frame, now),
+            Command::UserBytes { bytes, nonce_tail } => self.on_user_bytes(bytes, nonce_tail, now),
+            Command::UserDisconnect { nonce_tail } => self.on_user_disconnect(nonce_tail, now),
         }
     }
 
@@ -107,10 +139,15 @@ impl Machine {
     pub fn on_datagram(&mut self, bytes: &[u8], now: u32) -> Vec<Action> {
         match decode(bytes) {
             Ok(frame) => self.handle(Command::Packet(frame), now),
-            // A frame that cannot be parsed is dropped silently: the device
-            // stays silent on garbage too, and answering it would only feed a
-            // noise peer (spec B, §8).
-            Err(_) => Vec::new(),
+            // A frame that cannot be parsed is dropped: the device stays silent
+            // on garbage too, and answering it would only feed a noise peer.
+            Err(_) => {
+                if matches!(self.state, State::Established { .. }) {
+                    vec![Action::Warn("bad datagram".to_string())]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -202,9 +239,9 @@ impl Machine {
                 Self::handshake_packet(frame, nonce_a, psk, tries_left, nonce_b, now);
             self.state = state;
             actions
+        } else if matches!(self.state, State::Established { .. }) {
+            self.established_packet(frame, now)
         } else {
-            // After the handshake only encrypted frames arrive, and those are
-            // part of the protocol of part C.
             Vec::new()
         }
     }
@@ -276,6 +313,7 @@ impl Machine {
                         // The device numbers its own frames from 1, so the
                         // client starts there too.
                         tx_seq: 1,
+                        rx_seq: None,
                     },
                     vec![Action::Established { session_id }],
                 )
@@ -297,6 +335,206 @@ impl Machine {
             ),
         }
     }
+
+    /// A frame that arrived while the session is open.
+    fn established_packet(&mut self, frame: Frame, now: u32) -> Vec<Action> {
+        let (session_id, key) = match &self.state {
+            State::Established {
+                session_id, key, ..
+            } => (*session_id, *key),
+            _ => return Vec::new(),
+        };
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            return vec![Action::Warn("unexpected packet".to_string())];
+        };
+        // The session id decides first: a frame of another session must not be
+        // reported as a broken tag.
+        if frame.header.session_id != session_id {
+            return vec![Action::Warn("foreign session".to_string())];
+        }
+        // The nonce names the session, the direction and the sequence number.
+        if !nonce_matches(nonce, session_id, DIRECTION_ESP_TO_APP, frame.header.seq) {
+            return vec![Action::Warn("bad nonce".to_string())];
+        }
+        // The replay window of the header timestamp (protocol §5.7).
+        if Self::seconds_apart(now, frame.header.timestamp) >= TIMESTAMP_WINDOW_SECONDS {
+            return vec![Action::Warn("timestamp out of window".to_string())];
+        }
+        // The sequence number of the device has to grow. The first frame may
+        // carry any number.
+        let rx_seq = match &self.state {
+            State::Established { rx_seq, .. } => *rx_seq,
+            _ => None,
+        };
+        if let Some(last) = rx_seq {
+            if frame.header.seq <= last {
+                return vec![Action::Warn("bad seq".to_string())];
+            }
+        }
+        // The tag is the last check; the AAD is the header of the frame.
+        let aad = header_bytes(&frame.header);
+        let plain = match aes_gcm_decrypt(&key, nonce, &aad, ciphertext) {
+            Ok(plain) => plain,
+            Err(_) => return vec![Action::Warn("bad tag".to_string())],
+        };
+        // The frame is accepted: the receive counter moves.
+        if let State::Established { rx_seq, .. } = &mut self.state {
+            *rx_seq = Some(frame.header.seq);
+        }
+        match frame.header.packet_type {
+            PacketType::Data | PacketType::Push => vec![Action::Deliver(plain)],
+            PacketType::Close => {
+                // The peer closed the session: the reason is read from the
+                // decrypted body, and an unreadable body does not keep the
+                // session alive.
+                let reason = Some(Self::close_reason(&plain));
+                self.state = State::Closed;
+                vec![Action::Closed { reason }]
+            }
+            _ => vec![Action::Warn("unexpected packet".to_string())],
+        }
+    }
+
+    /// The reason of an incoming `CLOSE`: `{"reason":"..."}` (protocol §5.9).
+    ///
+    /// An unreadable body yields an empty reason; the session is closed
+    /// anyway, because the frame did arrive and its tag did match.
+    fn close_reason(plain: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(plain)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(|reason| reason.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    /// The difference of two timestamps, in seconds; the difference fits in
+    /// 32 bits.
+    fn seconds_apart(a: u32, b: u32) -> u32 {
+        let diff = (a as i64) - (b as i64);
+        diff.unsigned_abs() as u32
+    }
+
+    /// Encrypt a payload into an outgoing frame.
+    fn encrypt_frame(
+        packet_type: PacketType,
+        key: &[u8; 32],
+        session_id: u16,
+        seq: u32,
+        nonce_tail: [u8; 5],
+        now: u32,
+        plain: &[u8],
+    ) -> Frame {
+        let header = Header {
+            packet_type,
+            session_id,
+            seq,
+            timestamp: now,
+        };
+        // The client is the application side, so its direction byte is 0x00.
+        let nonce = build_nonce(session_id, DIRECTION_APP_TO_ESP, seq, nonce_tail);
+        let aad = header_bytes(&header);
+        // The key and the nonce have fixed lengths, so encryption only fails on
+        // a defect of the implementation.
+        let ciphertext = aes_gcm_encrypt(key, &nonce, &aad, plain)
+            .expect("AES-256-GCM key and nonce have fixed lengths, encryption cannot fail");
+        Frame {
+            header,
+            body: Body::Encrypted { nonce, ciphertext },
+        }
+    }
+
+    /// The user sends bytes: they go into the body of a `DATA` frame as they
+    /// are, without any parsing.
+    fn on_user_bytes(&mut self, bytes: Vec<u8>, nonce_tail: [u8; 5], now: u32) -> Vec<Action> {
+        let (session_id, key, tx_seq) = match &self.state {
+            State::Established {
+                session_id,
+                key,
+                tx_seq,
+                ..
+            } => (*session_id, *key, *tx_seq),
+            _ => return vec![Action::Warn("not established".to_string())],
+        };
+        // An empty body is not sent and does not spend a sequence number.
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        // A payload that does not fit into one datagram never reaches the
+        // wire, and it does not spend a sequence number either.
+        if bytes.len() > MAX_PLAINTEXT {
+            return vec![Action::Warn("payload too large".to_string())];
+        }
+        // The counter is never wrapped: at the ceiling the session ends.
+        if tx_seq == u32::MAX {
+            self.state = State::Failed;
+            return vec![Action::Failed("seq exhausted".to_string())];
+        }
+        let frame = Self::encrypt_frame(
+            PacketType::Data,
+            &key,
+            session_id,
+            tx_seq,
+            nonce_tail,
+            now,
+            &bytes,
+        );
+        if let State::Established { tx_seq, .. } = &mut self.state {
+            *tx_seq += 1;
+        }
+        vec![Action::Send(frame)]
+    }
+
+    /// The user disconnects: send an encrypted `CLOSE` and end the session.
+    fn on_user_disconnect(&mut self, nonce_tail: [u8; 5], now: u32) -> Vec<Action> {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        match state {
+            State::Established {
+                session_id,
+                key,
+                tx_seq,
+                ..
+            } => {
+                let mut actions = Vec::new();
+                // A spent counter means no `CLOSE` goes out, but the session
+                // still ends.
+                if tx_seq != u32::MAX {
+                    let frame = Self::encrypt_frame(
+                        PacketType::Close,
+                        &key,
+                        session_id,
+                        tx_seq,
+                        nonce_tail,
+                        now,
+                        CLOSE_BODY_USER_DISCONNECT,
+                    );
+                    actions.push(Action::Send(frame));
+                }
+                self.state = State::Closed;
+                actions.push(Action::Closed { reason: None });
+                actions
+            }
+            State::Handshake { .. } => {
+                self.state = State::Closed;
+                vec![Action::Closed { reason: None }]
+            }
+            state => {
+                self.state = state;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Test helper: move the send counter (only in an open session).
+    #[cfg(test)]
+    fn test_set_tx_seq(&mut self, seq: u32) {
+        if let State::Established { tx_seq, .. } = &mut self.state {
+            *tx_seq = seq;
+        }
+    }
 }
 
 impl Default for Machine {
@@ -314,12 +552,11 @@ impl fmt::Debug for Machine {
             State::Handshake { tries_left, .. } => {
                 write!(f, "Machine(Handshake, tries_left={tries_left})")
             }
-            State::Established {
-                session_id, tx_seq, ..
-            } => write!(
+            State::Established { tx_seq, rx_seq, .. } => write!(
                 f,
-                "Machine(Established, session_id={session_id}, tx_seq={tx_seq})"
+                "Machine(Established, tx_seq={tx_seq}, rx_seq={rx_seq:?})"
             ),
+            State::Closed => write!(f, "Machine(Closed)"),
             State::Failed => write!(f, "Machine(Failed)"),
         }
     }
@@ -329,6 +566,7 @@ impl fmt::Debug for Machine {
 mod tests {
     use super::*;
     use crate::session_udp::codec::PROOF_LEN;
+    use crate::session_udp::crypto::NONCE_LEN;
 
     const PSK: &str = "super-secret-psk";
     const NOW: u32 = 1_700_000_000;
@@ -340,6 +578,18 @@ mod tests {
 
     fn nonce_b() -> [u8; HANDSHAKE_NONCE_LEN] {
         [4u8; HANDSHAKE_NONCE_LEN]
+    }
+
+    fn tail() -> [u8; 5] {
+        [0xAB; 5]
+    }
+
+    /// The session key both sides derive.
+    fn session_key() -> [u8; 32] {
+        let mut salt = Vec::with_capacity(HANDSHAKE_NONCE_LEN * 2);
+        salt.extend_from_slice(&nonce_a());
+        salt.extend_from_slice(&nonce_b());
+        hkdf_sha256(PSK.as_bytes(), &salt, HKDF_INFO)
     }
 
     fn start(m: &mut Machine) -> Vec<Action> {
@@ -395,6 +645,32 @@ mod tests {
                 |a| matches!(a, Action::Established { session_id } if *session_id == SESSION_ID)
             )
         );
+    }
+
+    /// Encrypt a payload the way the device does, to feed the machine.
+    /// An encrypted frame the way the device builds it.
+    ///
+    /// The header is the AAD, so it has to be fixed before the encryption: a
+    /// header changed afterwards would not verify.
+    fn device_frame(packet_type: PacketType, seq: u32, timestamp: u32, plain: &[u8]) -> Frame {
+        let header = Header {
+            packet_type,
+            session_id: SESSION_ID,
+            seq,
+            timestamp,
+        };
+        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq, [0xCD; 5]);
+        let aad = header_bytes(&header);
+        let ciphertext = aes_gcm_encrypt(&session_key(), &nonce, &aad, plain).unwrap();
+        Frame {
+            header,
+            body: Body::Encrypted { nonce, ciphertext },
+        }
+    }
+
+    /// A DATA frame of the device.
+    fn device_data(seq: u32, plain: &[u8]) -> Frame {
+        device_frame(PacketType::Data, seq, NOW, plain)
     }
 
     /// The frame the machine sent, or a panic.
@@ -457,8 +733,15 @@ mod tests {
         };
         let actions = m.handle(Command::Packet(err), NOW);
         assert!(matches!(&actions[..], [Action::Failed(text)] if text == "session err 2"));
-        // The attempt is over: a SESSION_OK after the error opens nothing.
-        assert!(m.handle(Command::Packet(session_ok()), NOW).is_empty());
+        // The session is not open: user bytes still go nowhere.
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"x".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "not established"));
     }
 
     #[test]
@@ -502,6 +785,238 @@ mod tests {
     }
 
     #[test]
+    fn data_goes_both_ways() {
+        let mut m = Machine::new();
+        establish(&mut m);
+
+        // Outgoing: the payload is the body of a DATA frame as it is.
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"ping".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let frame = sent(&actions);
+        assert_eq!(frame.header.packet_type, PacketType::Data);
+        assert_eq!(frame.header.session_id, SESSION_ID);
+        assert_eq!(frame.header.seq, 1);
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            panic!("expected an encrypted body");
+        };
+        assert_eq!(
+            nonce,
+            &build_nonce(SESSION_ID, DIRECTION_APP_TO_ESP, 1, tail()),
+            "the client direction byte is 0x00"
+        );
+        let plain = aes_gcm_decrypt(
+            &session_key(),
+            nonce,
+            &header_bytes(&frame.header),
+            ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain, b"ping");
+
+        // Incoming: the device frame is decrypted and delivered.
+        let actions = m.handle(Command::Packet(device_data(1, b"{\"a\":1}")), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"{\"a\":1}"))
+        );
+    }
+
+    #[test]
+    fn empty_body_is_not_sent_and_does_not_spend_a_seq() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: Vec::new(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(actions.is_empty());
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"a".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert_eq!(sent(&actions).header.seq, 1);
+    }
+
+    #[test]
+    fn broken_tag_keeps_the_session_alive() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let mut frame = device_data(1, b"hello");
+        let Body::Encrypted { ciphertext, .. } = &mut frame.body else {
+            unreachable!()
+        };
+        ciphertext[0] ^= 0x01;
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "bad tag"));
+        // The next frame is delivered: the session did not die.
+        let actions = m.handle(Command::Packet(device_data(1, b"hello")), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"hello"))
+        );
+    }
+
+    #[test]
+    fn foreign_seq_keeps_the_session_alive() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // The first frame may carry any number.
+        let actions = m.handle(Command::Packet(device_data(7, b"first")), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"first"))
+        );
+        // The next one has to grow.
+        let actions = m.handle(Command::Packet(device_data(7, b"again")), NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "bad seq"));
+        let actions = m.handle(Command::Packet(device_data(8, b"next")), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"next"))
+        );
+    }
+
+    #[test]
+    fn foreign_session_and_bad_nonce_only_warn() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let mut frame = device_data(1, b"hello");
+        frame.header.session_id = SESSION_ID + 1;
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "foreign session"));
+
+        // The nonce must name the session, the direction and the seq.
+        let mut frame = device_data(1, b"hello");
+        let Body::Encrypted { nonce, .. } = &mut frame.body else {
+            unreachable!()
+        };
+        nonce[2] = DIRECTION_APP_TO_ESP;
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "bad nonce"));
+    }
+
+    #[test]
+    fn timestamp_outside_the_window_only_warns() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let frame = device_frame(
+            PacketType::Data,
+            1,
+            NOW - TIMESTAMP_WINDOW_SECONDS,
+            b"hello",
+        );
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "timestamp out of window"));
+        // Inside the window the frame is delivered.
+        let frame = device_frame(
+            PacketType::Data,
+            1,
+            NOW - TIMESTAMP_WINDOW_SECONDS + 1,
+            b"hello",
+        );
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"hello"))
+        );
+    }
+
+    #[test]
+    fn own_close_carries_the_reason() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(Command::UserDisconnect { nonce_tail: tail() }, NOW);
+        let frame = sent(&actions);
+        assert_eq!(frame.header.packet_type, PacketType::Close);
+        assert_eq!(frame.header.session_id, SESSION_ID);
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            panic!("expected an encrypted body");
+        };
+        assert_eq!(
+            nonce,
+            &build_nonce(SESSION_ID, DIRECTION_APP_TO_ESP, 1, tail())
+        );
+        let plain = aes_gcm_decrypt(
+            &session_key(),
+            nonce,
+            &header_bytes(&frame.header),
+            ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain, br#"{"reason":"user_disconnect"}"#);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Closed { reason: None }))
+        );
+    }
+
+    #[test]
+    fn incoming_close_closes_the_session_with_its_reason() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let frame = device_frame(PacketType::Close, 1, NOW, br#"{"reason":"timeout"}"#);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Closed { reason: Some(r) } if r == "timeout"))
+        );
+    }
+
+    #[test]
+    fn push_is_delivered_and_keeps_the_session_alive() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let frame = device_frame(PacketType::Push, 1, NOW, b"snapshot");
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"snapshot"))
+        );
+        // The session is still open: a DATA frame is still delivered.
+        let actions = m.handle(Command::Packet(device_data(2, b"more")), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"more"))
+        );
+    }
+
+    #[test]
+    fn spent_seq_fails_without_sending() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        m.test_set_tx_seq(u32::MAX);
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"a".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(matches!(&actions[..], [Action::Failed(text)] if text == "seq exhausted"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Send(_))));
+    }
+
+    #[test]
     fn empty_secret_fails_before_hello() {
         let mut m = Machine::new();
         let actions = m.handle(
@@ -514,6 +1029,43 @@ mod tests {
         );
         assert!(matches!(&actions[..], [Action::Failed(text)] if text == "empty psk"));
         assert!(m.handle(Command::Tick, NOW).is_empty());
+    }
+
+    #[test]
+    fn payload_over_the_limit_is_not_sent() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: vec![0u8; MAX_PLAINTEXT + 1],
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "payload too large"));
+        // The sequence number was not spent.
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"a".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert_eq!(sent(&actions).header.seq, 1);
+    }
+
+    #[test]
+    fn bytes_before_the_session_are_not_sent() {
+        let mut m = Machine::new();
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"clear".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "not established"));
+        assert!(!format!("{actions:?}").contains("clear"));
     }
 
     #[test]
@@ -549,16 +1101,26 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_datagram_is_dropped_silently() {
+    fn a_broken_datagram_only_warns_in_an_open_session() {
         let mut m = Machine::new();
         // During the handshake a broken frame is dropped silently.
         let _ = start(&mut m);
         assert!(m.on_datagram(&[0u8; 3], NOW).is_empty());
-        // And after the handshake the frames of part C are not read yet.
+        // The handshake finishes, and then the broken frame only warns.
         let challenge = challenge();
         let _ = m.handle(Command::Packet(challenge), NOW);
         let ok = m.handle(Command::Packet(session_ok()), NOW);
         assert!(ok.iter().any(|a| matches!(a, Action::Established { .. })));
-        assert!(m.on_datagram(&[0u8; 3], NOW).is_empty());
+        let actions = m.on_datagram(&[0u8; 3], NOW);
+        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "bad datagram"));
+    }
+
+    #[test]
+    fn the_nonce_length_is_twelve() {
+        assert_eq!(NONCE_LEN, 12);
+        assert_eq!(
+            build_nonce(SESSION_ID, DIRECTION_APP_TO_ESP, 1, tail()).len(),
+            NONCE_LEN
+        );
     }
 }
