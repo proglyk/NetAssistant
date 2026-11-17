@@ -4667,11 +4667,15 @@ impl NetAssistantApp {
 
                     if let Some(tab_state) = self.connection_tabs.get_mut(&tab_id) {
                         // 设置消息类型
-                        message.set_message_type(if tab_state.message_input_mode == "text" {
-                            MessageType::Text
-                        } else {
-                            MessageType::Hex
-                        });
+                        // 阶段消息（UDP 会话日志行）是协议事件的解读，不是用户数据：
+                        // 它的内容是文本，不随输入框的文本/十六进制模式切换。
+                        if message.stage.is_none() {
+                            message.set_message_type(if tab_state.message_input_mode == "text" {
+                                MessageType::Text
+                            } else {
+                                MessageType::Hex
+                            });
+                        }
                         message_batch.push(message);
                     }
                 }

@@ -13,13 +13,13 @@
 //! `docs-dev/specs/2026-11-17-udp-session-c-data-close.md` (DATA / CLOSE).
 
 use crate::config::connection::{ClientConfig, ServerConfig, TrailerSetting};
-use crate::message::{Message, MessageDirection, MessageType};
+use crate::message::{Message, MessageDirection, MessageStage, MessageType};
 use crate::network::events::{ConnectionEvent, NetCounters, ReceivedBatch, WireMessage};
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
-use crate::session_udp::codec::{HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, PacketType, encode};
+use crate::session_udp::codec::{Frame, HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, PacketType, encode};
 use crate::session_udp::machine::{
-    Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome,
+    Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome, Trace,
 };
 use log::{debug, error, info, warn};
 use rust_i18n::t;
@@ -107,6 +107,144 @@ fn warn_text(token: &str) -> String {
         "bad datagram" => t!("udp_session.warn_bad_datagram").to_string(),
         other => other.to_string(),
     }
+}
+
+/// Translate a protocol event into the lines of the session window.
+///
+/// Every line carries a stage (the scheme of `docs-dev/pictures/udp-path.png`);
+/// the text is a short decode of the event, not a raw dump of the frame.
+fn trace_lines(trace: &Trace) -> Vec<(MessageStage, MessageDirection, String)> {
+    match trace {
+        Trace::Datagram => vec![(
+            MessageStage::Socket,
+            MessageDirection::Received,
+            t!("udp_session.trace_datagram").to_string(),
+        )],
+        Trace::Decoded { packet_type } => {
+            let body = match packet_type {
+                PacketType::Hello => t!("udp_session.trace_body_hello"),
+                PacketType::Challenge => t!("udp_session.trace_body_challenge"),
+                PacketType::Response => t!("udp_session.trace_body_response"),
+                PacketType::SessionOk => t!("udp_session.trace_body_session_ok"),
+                PacketType::SessionErr => t!("udp_session.trace_body_session_err"),
+                PacketType::Data | PacketType::Push | PacketType::Close => {
+                    t!("udp_session.trace_body_encrypted")
+                }
+            };
+            let cipher = if packet_type.is_encrypted() {
+                t!("udp_session.trace_cipher_gcm")
+            } else {
+                t!("udp_session.trace_cipher_null")
+            };
+            vec![
+                (
+                    MessageStage::Decoder,
+                    MessageDirection::Received,
+                    t!(
+                        "udp_session.trace_decoded",
+                        packet = packet_type.name(),
+                        body = body.as_ref()
+                    )
+                    .to_string(),
+                ),
+                (
+                    MessageStage::Decoder,
+                    MessageDirection::Received,
+                    cipher.to_string(),
+                ),
+            ]
+        }
+        Trace::Decrypted => vec![(
+            MessageStage::Decoder,
+            MessageDirection::Received,
+            t!("udp_session.trace_decrypted").to_string(),
+        )],
+        Trace::ProofB { valid } => vec![
+            (
+                MessageStage::Handshake,
+                MessageDirection::Received,
+                t!("udp_session.trace_proof_b").to_string(),
+            ),
+            (
+                MessageStage::Handshake,
+                MessageDirection::Received,
+                if *valid {
+                    t!("udp_session.trace_proof_b_ok").to_string()
+                } else {
+                    t!("udp_session.trace_proof_b_bad").to_string()
+                },
+            ),
+        ],
+        Trace::ProofA => vec![(
+            MessageStage::Handshake,
+            MessageDirection::Sent,
+            t!("udp_session.trace_proof_a").to_string(),
+        )],
+        Trace::SessionOpen => vec![
+            (
+                MessageStage::Session,
+                MessageDirection::Received,
+                t!("udp_session.trace_session_key").to_string(),
+            ),
+            (
+                MessageStage::Session,
+                MessageDirection::Received,
+                t!("udp_session.trace_open_session").to_string(),
+            ),
+        ],
+    }
+}
+
+/// The sender stage: what goes out, with which cipher, and with what result.
+async fn send_trace(
+    event_sender: &Option<Sender<ConnectionEvent>>,
+    id: &str,
+    direction: MessageDirection,
+    stage: MessageStage,
+    text: String,
+) {
+    let Some(sender) = event_sender else {
+        return;
+    };
+    let message = Message::new(direction, text.into_bytes(), MessageType::Text).with_stage(stage);
+    let _ = sender
+        .send(ConnectionEvent::MessageReceived(id.to_string(), message))
+        .await;
+}
+
+/// The sender stage lines of a frame that goes out: the frame and its cipher.
+///
+/// The result of the write follows in the caller: only there is it known.
+async fn sender_stage_lines(
+    event_sender: &Option<Sender<ConnectionEvent>>,
+    id: &str,
+    frame: &Frame,
+) {
+    let cipher = if frame.header.packet_type.is_encrypted() {
+        t!("udp_session.trace_cipher_gcm")
+    } else {
+        t!("udp_session.trace_cipher_null")
+    };
+    send_trace(
+        event_sender,
+        id,
+        MessageDirection::Sent,
+        MessageStage::Sender,
+        t!(
+            "udp_session.trace_send",
+            packet = frame.header.packet_type.name()
+        )
+        .to_string(),
+    )
+    .await;
+    send_trace(
+        event_sender,
+        id,
+        MessageDirection::Sent,
+        MessageStage::Sender,
+        t!("udp_session.trace_encrypt", cipher = cipher.as_ref()).to_string(),
+    )
+    .await;
 }
 
 /// The close reason of the peer, in interface text (protocol §5.9).
@@ -280,11 +418,21 @@ impl NetworkConnection for UdpSessionClient {
             // peer see us.
             for action in &actions {
                 if let Action::Send(packet) = action {
+                    // The sender stage shows the frame before it goes out.
+                    sender_stage_lines(&event_sender, &config.id, packet).await;
                     let bytes = encode(packet);
                     socket
                         .send(&bytes)
                         .await
                         .map_err(|e| format!("failed to send HELLO: {}", e))?;
+                    send_trace(
+                        &event_sender,
+                        &config.id,
+                        MessageDirection::Sent,
+                        MessageStage::Sender,
+                        t!("udp_session.trace_success").to_string(),
+                    )
+                    .await;
                     if let Some(c) = &net_counters {
                         c.add_sent(1);
                         c.add_sent_bytes(bytes.len() as u64);
@@ -465,9 +613,20 @@ async fn apply(
     for action in actions {
         match action {
             Action::Send(frame) => {
+                // The sender stage shows what goes out: the frame, the cipher
+                // and the result of the write.
+                sender_stage_lines(event_sender, id, &frame).await;
                 let bytes = encode(&frame);
                 match socket.send(&bytes).await {
                     Ok(_) => {
+                        send_trace(
+                            event_sender,
+                            id,
+                            MessageDirection::Sent,
+                            MessageStage::Sender,
+                            t!("udp_session.trace_success").to_string(),
+                        )
+                        .await;
                         if let Some(c) = net_counters {
                             c.add_sent(1);
                             c.add_sent_bytes(bytes.len() as u64);
@@ -490,6 +649,11 @@ async fn apply(
                         }
                         flow = Flow::Stop;
                     }
+                }
+            }
+            Action::Trace(trace) => {
+                for (stage, direction, text) in trace_lines(trace) {
+                    send_trace(event_sender, id, direction, stage, text).await;
                 }
             }
             Action::Deliver(plain) => {
@@ -893,11 +1057,14 @@ mod tests {
         let hint_waiting = t!("udp_session.hint_waiting").to_string();
         let mut write_tx = None;
         let mut seen_established = false;
-        for _ in 0..4 {
+        // The trace of the session stages also comes as events: they are informational
+        // and do not change the protocol order.
+        for _ in 0..32 {
             let ev = next_event(&rx).await;
             match ev {
                 ConnectionEvent::Connected(_, _) => {}
                 ConnectionEvent::ClientWriteSenderReady(_, s) => write_tx = Some(s),
+                ConnectionEvent::MessageReceived(_, m) if m.stage.is_some() => {}
                 ConnectionEvent::StatusHint(_, text) => {
                     if text == hint_established {
                         assert!(
@@ -1413,5 +1580,107 @@ mod tests {
             }
             other => panic!("expected StatusHint, got {other:?}"),
         }
+    }
+
+    /// The session log lines: the messages that carry a stage.
+    fn stage_lines(events: &[ConnectionEvent]) -> Vec<(MessageStage, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ConnectionEvent::MessageReceived(_, message) => message
+                    .stage
+                    .map(|stage| (stage, message.get_content_by_type().to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn loopback_the_session_frames_are_visible_in_the_log() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+
+        let (nonce_a, client_addr, _) = recv_hello(&peer).await;
+        peer_send_challenge(&peer, client_addr, nonce_a).await;
+        peer_recv_response(&peer, nonce_a).await;
+        peer_send_session_ok(&peer, client_addr).await;
+        // The peer closes the session: the CLOSE frame belongs to the log too.
+        peer_send_encrypted(
+            &peer,
+            client_addr,
+            nonce_a,
+            PacketType::Close,
+            1,
+            br#"{"reason":"user_disconnect"}"#,
+        )
+        .await;
+
+        // The frames are logged as they arrive: wait for the last one instead
+        // of a fixed window, so a loaded machine does not fail the test.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut lines: Vec<(MessageStage, String)> = Vec::new();
+        while !lines.iter().any(|(_, text)| text.contains("CLOSE")) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let events = collect_for(&rx, remaining.min(Duration::from_millis(200))).await;
+            lines.extend(stage_lines(&events));
+        }
+        // The HELLO goes out: the sender stage shows the frame.
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, text)| *stage == MessageStage::Sender && text.contains("HELLO"))
+        );
+        // The challenge comes in: the socket stage sees the datagram, the
+        // decoder stage decodes it.
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, _)| *stage == MessageStage::Socket)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("CHALLENGE"))
+        );
+        // The proof check and the session key have their own stages.
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, _)| *stage == MessageStage::Handshake)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, _)| *stage == MessageStage::Session)
+        );
+        // The RESPONSE goes out.
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, text)| *stage == MessageStage::Sender && text.contains("RESPONSE"))
+        );
+        // The SESSION_OK and the CLOSE of the peer are decoded as well.
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("SESSION_OK"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("CLOSE"))
+        );
     }
 }
