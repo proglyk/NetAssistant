@@ -102,11 +102,41 @@ pub struct CommandReply {
     pub command: Option<PendingCommand>,
 }
 
+/// Protocol event: the client turns it into a log line with a stage.
+///
+/// The machine reports facts, not text: the wording belongs to the client,
+/// which knows the UI language. Every event except `ProofA` describes a
+/// received datagram; `ProofA` describes the client proof the machine has
+/// just computed for the outgoing RESPONSE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trace {
+    /// A datagram arrived (socket stage).
+    Datagram,
+    /// The frame was parsed (decoder stage).
+    Decoded {
+        /// Type of the parsed frame.
+        packet_type: PacketType,
+    },
+    /// The frame was decrypted (decoder stage).
+    Decrypted,
+    /// The device proof was checked (handshake stage).
+    ProofB {
+        /// Whether the proof matched the secret.
+        valid: bool,
+    },
+    /// The client proof was computed (handshake stage).
+    ProofA,
+    /// The session key was derived and the session is open (session stage).
+    SessionOpen,
+}
+
 /// State machine output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// A frame that has to go out.
     Send(Frame),
+    /// A protocol event to show in the session log.
+    Trace(Trace),
     /// Decrypted plaintext.
     Deliver(Vec<u8>),
     /// The handshake is over, the session is open.
@@ -193,18 +223,23 @@ impl Machine {
     /// Handle one received datagram: parse it first, and decide by the current
     /// state whether a broken frame is a failure or is dropped silently.
     pub fn on_datagram(&mut self, bytes: &[u8], now: u32) -> Vec<Action> {
+        let mut actions = vec![Action::Trace(Trace::Datagram)];
         match decode(bytes) {
-            Ok(frame) => self.handle(Command::Packet(frame), now),
+            Ok(frame) => {
+                actions.push(Action::Trace(Trace::Decoded {
+                    packet_type: frame.header.packet_type,
+                }));
+                actions.extend(self.handle(Command::Packet(frame), now));
+            }
             // A frame that cannot be parsed is dropped: the device stays silent
             // on garbage too, and answering it would only feed a noise peer.
             Err(_) => {
                 if matches!(self.state, State::Established { .. }) {
-                    vec![Action::Warn("bad datagram".to_string())]
-                } else {
-                    Vec::new()
+                    actions.push(Action::Warn("bad datagram".to_string()));
                 }
             }
         }
+        actions
     }
 
     /// Start the handshake: only from `Idle`.
@@ -319,8 +354,13 @@ impl Machine {
                 // The device proves that it knows the secret. Without this
                 // check the client would answer a stranger.
                 let input = proof_b_input(&nonce_a, &device_nonce);
-                if !hmac_verify(psk.as_bytes(), &input, &proof_b) {
-                    return (State::Failed, vec![Action::Failed("bad proof".to_string())]);
+                let valid = hmac_verify(psk.as_bytes(), &input, &proof_b);
+                let trace = Action::Trace(Trace::ProofB { valid });
+                if !valid {
+                    return (
+                        State::Failed,
+                        vec![trace, Action::Failed("bad proof".to_string())],
+                    );
                 }
                 // The client proves the same, with the other context byte.
                 let proof_a = hmac_sha256(psk.as_bytes(), &proof_a_input(&device_nonce, &nonce_a));
@@ -340,7 +380,7 @@ impl Machine {
                         tries_left,
                         nonce_b: Some(device_nonce),
                     },
-                    vec![Action::Send(response)],
+                    vec![trace, Action::Trace(Trace::ProofA), Action::Send(response)],
                 )
             }
             Body::SessionOk => {
@@ -373,7 +413,10 @@ impl Machine {
                         // No command has been sent yet.
                         pending: Vec::new(),
                     },
-                    vec![Action::Established { session_id }],
+                    vec![
+                        Action::Trace(Trace::SessionOpen),
+                        Action::Established { session_id },
+                    ],
                 )
             }
             Body::SessionErr { code } => (
@@ -445,7 +488,8 @@ impl Machine {
                 // answer of the device is parsed aside: an "ack" or an
                 // "error" is a reply to a command.
                 let reply = self.take_reply(&plain);
-                let mut actions = vec![Action::Deliver(plain)];
+                let mut actions = vec![Action::Trace(Trace::Decrypted)];
+                actions.push(Action::Deliver(plain));
                 if let Some(reply) = reply {
                     actions.push(Action::Reply(reply));
                 }
@@ -454,7 +498,7 @@ impl Machine {
             PacketType::Push => {
                 // The body of a push is not parsed: the snapshots and the
                 // events are not in the scope of the client yet (spec F).
-                vec![Action::Deliver(plain)]
+                vec![Action::Trace(Trace::Decrypted), Action::Deliver(plain)]
             }
             PacketType::Close => {
                 // The peer closed the session: the reason is read from the
@@ -462,7 +506,7 @@ impl Machine {
                 // session alive.
                 let reason = Some(Self::close_reason(&plain));
                 self.state = State::Closed;
-                vec![Action::Closed { reason }]
+                vec![Action::Trace(Trace::Decrypted), Action::Closed { reason }]
             }
             _ => vec![Action::Warn("unexpected packet".to_string())],
         }
@@ -716,7 +760,7 @@ impl fmt::Debug for Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_udp::codec::PROOF_LEN;
+    use crate::session_udp::codec::{PROOF_LEN, encode};
     use crate::session_udp::crypto::NONCE_LEN;
 
     const PSK: &str = "super-secret-psk";
@@ -789,7 +833,7 @@ mod tests {
         assert!(matches!(hello[0], Action::Send(_)));
         let challenge = challenge();
         let response = m.handle(Command::Packet(challenge), NOW);
-        assert!(matches!(response[0], Action::Send(_)));
+        assert!(response.iter().any(|a| matches!(a, Action::Send(_))));
         let ok = m.handle(Command::Packet(session_ok()), NOW);
         assert!(
             ok.iter().any(
@@ -825,11 +869,17 @@ mod tests {
     }
 
     /// The frame the machine sent, or a panic.
+    ///
+    /// The traces of the protocol events may come first: the frame is the
+    /// first action that goes out.
     fn sent(actions: &[Action]) -> &Frame {
-        match &actions[0] {
-            Action::Send(frame) => frame,
-            other => panic!("expected a frame to send, got {other:?}"),
-        }
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Send(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("expected a frame to send")
     }
 
     #[test]
@@ -926,13 +976,59 @@ mod tests {
         };
         *proof_b = [9u8; PROOF_LEN];
         let actions = m.handle(Command::Packet(challenge), NOW);
-        match &actions[..] {
-            [Action::Failed(text)] => {
-                assert_eq!(text, "bad proof");
-                assert!(!text.contains(PSK));
-            }
-            other => panic!("{other:?}"),
-        }
+        // The trace of the failed proof comes first, then the failure.
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Trace(Trace::ProofB { valid: false }))
+        ));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Failed(text) if text == "bad proof" && !text.contains(PSK)
+        )));
+    }
+
+    #[test]
+    fn the_handshake_reports_its_stages() {
+        let mut m = Machine::new();
+        let _ = start(&mut m);
+
+        // The challenge: the datagram, the decoded frame, the proof check and
+        // the client proof.
+        let actions = m.on_datagram(&encode(&challenge()), NOW);
+        let traces: Vec<&Trace> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Trace(trace) => Some(trace),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            traces,
+            vec![
+                &Trace::Datagram,
+                &Trace::Decoded {
+                    packet_type: PacketType::Challenge
+                },
+                &Trace::ProofB { valid: true },
+                &Trace::ProofA,
+            ]
+        );
+        // The RESPONSE goes out after the traces of the challenge.
+        assert!(actions.iter().any(|a| matches!(a, Action::Send(_))));
+    }
+
+    #[test]
+    fn the_session_open_is_reported() {
+        let mut m = Machine::new();
+        let _ = start(&mut m);
+        // The session opens only after a challenge was answered.
+        let _ = m.on_datagram(&encode(&challenge()), NOW);
+        let actions = m.on_datagram(&encode(&session_ok()), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace(Trace::SessionOpen)))
+        );
     }
 
     #[test]
@@ -1254,16 +1350,21 @@ mod tests {
     #[test]
     fn a_broken_datagram_only_warns_in_an_open_session() {
         let mut m = Machine::new();
-        // During the handshake a broken frame is dropped silently.
+        // During the handshake a broken frame is dropped silently: the socket
+        // stage sees the datagram, but no warning is raised.
         let _ = start(&mut m);
-        assert!(m.on_datagram(&[0u8; 3], NOW).is_empty());
+        let actions = m.on_datagram(&[0u8; 3], NOW);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Warn(_))));
         // The handshake finishes, and then the broken frame only warns.
         let challenge = challenge();
         let _ = m.handle(Command::Packet(challenge), NOW);
         let ok = m.handle(Command::Packet(session_ok()), NOW);
         assert!(ok.iter().any(|a| matches!(a, Action::Established { .. })));
         let actions = m.on_datagram(&[0u8; 3], NOW);
-        assert!(matches!(&actions[..], [Action::Warn(text)] if text == "bad datagram"));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Warn(text) if text == "bad datagram"
+        )));
     }
 
     #[test]

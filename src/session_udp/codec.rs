@@ -102,6 +102,20 @@ impl PacketType {
             PacketType::Data | PacketType::Push | PacketType::Close
         )
     }
+
+    /// The name of the type on the wire (protocol §5.3), for the session log.
+    pub fn name(self) -> &'static str {
+        match self {
+            PacketType::Hello => "HELLO",
+            PacketType::Challenge => "CHALLENGE",
+            PacketType::Response => "RESPONSE",
+            PacketType::SessionOk => "SESSION_OK",
+            PacketType::SessionErr => "SESSION_ERR",
+            PacketType::Data => "DATA",
+            PacketType::Push => "PUSH",
+            PacketType::Close => "CLOSE",
+        }
+    }
 }
 
 /// Frame header (protocol §5.2).
