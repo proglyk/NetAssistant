@@ -7,7 +7,8 @@ use crate::config;
 use crate::config::app_stats::AppStats;
 use crate::config::connection::{
     ConnectionConfig, ConnectionStatus, ConnectionType, DecoderConfig, MqttSettings, MqttVersion,
-    Qos, TlsSettings, TlsVerifyMode, TrailerKind, WillSettings, generate_mqtt_client_id,
+    Qos, TlsSettings, TlsVerifyMode, TrailerKind, UdpSessionSettings, WillSettings,
+    connection_type_from_dialog, generate_mqtt_client_id,
 };
 use crate::config::storage::{ConfigStorage, MqttTopicHistoryEntry};
 use crate::core::toolbox::ToolCategory;
@@ -203,6 +204,14 @@ pub struct NetAssistantApp {
     pub mqtt_tls_key_input: Entity<InputState>,
     /// ALPN 列表（逗号分隔，可选）
     pub mqtt_tls_alpn_input: Entity<InputState>,
+
+    // UDP Session 表单状态（仅协议为 UDP Session 时渲染与回填）
+    /// 预共享密钥（普通输入框；与 MQTT 密码同域，不进日志）
+    pub udp_session_psk_input: Entity<InputState>,
+    /// 握手超时（毫秒）
+    pub udp_session_timeout_input: Entity<InputState>,
+    /// HELLO 重试次数
+    pub udp_session_retries_input: Entity<InputState>,
 
     // 解码器选择对话框状态(打开时创建, 关闭时置 None)
     pub decoder_selection_dialog: Option<DecoderSelectionDialogState>,
@@ -406,6 +415,10 @@ impl NetAssistantApp {
         });
         let mqtt_will_topic_input = cx.new(|cx| InputState::new(window, cx));
         let mqtt_will_payload_input = cx.new(|cx| InputState::new(window, cx));
+        // UDP Session 表单输入框（仅协议为 UDP Session 时渲染）
+        let udp_session_psk_input = cx.new(|cx| InputState::new(window, cx));
+        let udp_session_timeout_input = cx.new(|cx| InputState::new(window, cx));
+        let udp_session_retries_input = cx.new(|cx| InputState::new(window, cx));
         // TLS 证书路径输入（可手动填写，也可由「选择文件」回填）
         let mqtt_tls_ca_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -561,6 +574,10 @@ impl NetAssistantApp {
             mqtt_tls_cert_input,
             mqtt_tls_key_input,
             mqtt_tls_alpn_input,
+            // 初始化 UDP Session 表单状态
+            udp_session_psk_input,
+            udp_session_timeout_input,
+            udp_session_retries_input,
             // 初始化解码器选择对话框状态
             decoder_selection_dialog: None,
             server_expanded: true,
@@ -2098,6 +2115,13 @@ impl NetAssistantApp {
             .update(cx, |i, cx| i.set_value(String::new(), window, cx));
         self.mqtt_tls_alpn_input
             .update(cx, |i, cx| i.set_value(String::new(), window, cx));
+        // UDP Session 表单重置为默认值（PSK 空、超时 1000ms、重试 3 次）
+        self.udp_session_psk_input
+            .update(cx, |i, cx| i.set_value(String::new(), window, cx));
+        self.udp_session_timeout_input
+            .update(cx, |i, cx| i.set_value("1000".to_string(), window, cx));
+        self.udp_session_retries_input
+            .update(cx, |i, cx| i.set_value("3".to_string(), window, cx));
 
         let default_host = if is_client { "127.0.0.1" } else { "0.0.0.0" };
         self.host_input.update(cx, |i, cx| {
@@ -2153,6 +2177,7 @@ impl NetAssistantApp {
             ConnectionType::Tcp => "TCP".to_string(),
             ConnectionType::Udp => "UDP".to_string(),
             ConnectionType::Mqtt => "MQTT".to_string(),
+            ConnectionType::UdpSession => "UDP Session".to_string(),
         };
         self.connection_form_error = None;
 
@@ -2288,6 +2313,28 @@ impl NetAssistantApp {
             i.set_value(tls.alpn.clone().unwrap_or_default(), window, cx)
         });
 
+        // UDP Session 字段回填：仅 UDP Session 的客户端配置有值，其余留空
+        let udp_settings = match &config {
+            ConnectionConfig::Client(c) if c.protocol == ConnectionType::UdpSession => {
+                Some(c.udp_session.clone().unwrap_or_default())
+            }
+            _ => None,
+        };
+        let (udp_psk, udp_timeout, udp_retries) = match udp_settings {
+            Some(s) => (
+                s.psk,
+                s.handshake_timeout_ms.to_string(),
+                s.hello_retries.to_string(),
+            ),
+            None => (String::new(), String::new(), String::new()),
+        };
+        self.udp_session_psk_input
+            .update(cx, |i, cx| i.set_value(udp_psk, window, cx));
+        self.udp_session_timeout_input
+            .update(cx, |i, cx| i.set_value(udp_timeout, window, cx));
+        self.udp_session_retries_input
+            .update(cx, |i, cx| i.set_value(udp_retries, window, cx));
+
         // 命令式打开对话框(由 Root 管理层叠)
         open_new_connection_dialog(cx.entity().downgrade(), window, cx);
     }
@@ -2364,12 +2411,12 @@ impl NetAssistantApp {
 
         let message_input_mode = self.edit_message_input_mode.clone();
         let decoder_config = self.edit_decoder_config.clone();
-        let connection_type = if self.new_connection_protocol == "TCP" {
-            ConnectionType::Tcp
-        } else if is_mqtt {
-            ConnectionType::Mqtt
-        } else {
-            ConnectionType::Udp
+        // 协议由对话框字符串决定：认不出的字符串算表单错误，不创建连接
+        let Some(connection_type) = connection_type_from_dialog(&self.new_connection_protocol)
+        else {
+            self.connection_form_error = Some(t!("new_connection.error_bad_protocol").to_string());
+            cx.notify();
+            return false;
         };
         let is_client = self.new_connection_is_client;
 
@@ -2535,6 +2582,57 @@ impl NetAssistantApp {
             None
         };
 
+        // UDP Session 设置（仅该协议构造；空 PSK 不拦表单，由客户端 connect 拒绝）
+        let udp_session_settings = if connection_type == ConnectionType::UdpSession {
+            // PSK 不做 trim：空白也可能是合法密钥的一部分
+            let psk = self.udp_session_psk_input.read(cx).value().to_string();
+            let timeout_str = self
+                .udp_session_timeout_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            let handshake_timeout_ms = if timeout_str.is_empty() {
+                1000
+            } else {
+                match timeout_str.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.connection_form_error =
+                            Some(t!("new_connection.error_bad_udp_session_timeout").to_string());
+                        cx.notify();
+                        return false;
+                    }
+                }
+            };
+            let retries_str = self
+                .udp_session_retries_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            let hello_retries = if retries_str.is_empty() {
+                3
+            } else {
+                match retries_str.parse::<u8>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.connection_form_error =
+                            Some(t!("new_connection.error_bad_udp_session_retries").to_string());
+                        cx.notify();
+                        return false;
+                    }
+                }
+            };
+            Some(UdpSessionSettings {
+                psk,
+                handshake_timeout_ms,
+                hello_retries,
+            })
+        } else {
+            None
+        };
+
         if let Some(edit_id) = self.editing_connection_id.take() {
             // 编辑模式：保留 id / 类型 / 协议，更新其余字段
             let existing = self
@@ -2556,6 +2654,8 @@ impl NetAssistantApp {
                         c.local_port = local_port;
                         // MQTT 设置覆盖（非 MQTT 为 None，保持既有 mqtt 字段不变）
                         c.mqtt = mqtt_settings.clone();
+                        // UDP Session 设置同规则：非该协议为 None
+                        c.udp_session = udp_session_settings.clone();
                     }
                     ConnectionConfig::Server(c) => {
                         c.listen_address = host;
@@ -2594,6 +2694,7 @@ impl NetAssistantApp {
                     c.local_address = local_address.clone();
                     c.local_port = local_port;
                     c.mqtt = mqtt_settings.clone();
+                    c.udp_session = udp_session_settings.clone();
                 }
                 ConnectionConfig::Server(c) => {
                     c.message_input_mode = message_input_mode;

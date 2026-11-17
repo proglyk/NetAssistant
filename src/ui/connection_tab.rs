@@ -439,6 +439,7 @@ impl ConnectionTabState {
             ConnectionType::Tcp => "TCP",
             ConnectionType::Udp => "UDP",
             ConnectionType::Mqtt => "MQTT",
+            ConnectionType::UdpSession => "UDP Session",
         }
     }
 
@@ -967,6 +968,11 @@ impl<'a> ConnectionTab<'a> {
         let theme = cx.theme().clone();
         let is_client = self.tab_state.connection_config.is_client();
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
+        let is_udp_session =
+            self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+        // 压测/解码器/trailer 这类"流式工具"对 MQTT 与 UDP Session 都收起：
+        // 两者都是自带分帧的应用层协议，压测与解码器没有意义
+        let hide_stream_tools = is_mqtt || is_udp_session;
         let view_mode = self.tab_state.view_mode;
         let tab_id = self.tab_id.clone();
 
@@ -977,7 +983,7 @@ impl<'a> ConnectionTab<'a> {
             .min_w_0()
             .min_h_0()
             // 顶部 tab 切换栏(仅客户端且有压测能力时显示; MQTT 隐藏压测 tab, 规划 D-8)
-            .when(is_client && !is_mqtt, |d| {
+            .when(is_client && !hide_stream_tools, |d| {
                 d.child(self.render_view_mode_tabs(&theme, view_mode, tab_id.clone(), cx))
             })
             // 内容区
@@ -3303,6 +3309,10 @@ impl<'a> ConnectionTab<'a> {
 
         let is_client = self.tab_state.connection_config.is_client();
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
+        let is_udp_session =
+            self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+        // 与 MQTT 同理：会话语义下 trailer 与发送任务都收起
+        let hide_stream_tools = is_mqtt || is_udp_session;
         let selected_client = &self.tab_state.selected_client;
 
         div()
@@ -3609,7 +3619,8 @@ impl<'a> ConnectionTab<'a> {
                                     }),
                             )
                             // MQTT 隐藏 trailer 下拉(配置层强制 None, 规划 D-7)与发送任务按钮(D-8)
-                            .when(!is_mqtt, |this| {
+                            // UDP Session 同理：DATA 载荷不可被追加字节污染
+                            .when(!hide_stream_tools, |this| {
                                 this
                             // 「结尾」下拉: 无 / LF / CRLF 三态循环, 改动即时生效并持久化
                             .child({

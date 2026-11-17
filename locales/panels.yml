@@ -928,3 +928,53 @@ mqtt_history:
   clear:
     zh-CN: 清空历史
     en: Clear History
+
+udp_session:
+  err_empty_psk:
+    zh-CN: 预共享密钥为空
+    en: Pre-shared key is empty
+  err_handshake_timeout:
+    zh-CN: 握手超时
+    en: Handshake timed out
+  err_bad_proof:
+    zh-CN: 会话证实失败
+    en: Session proof rejected
+  err_bad_session_err:
+    zh-CN: 会话错误报文损坏
+    en: Session error packet is corrupt
+  err_session:
+    zh-CN: 会话错误 %{detail}
+    en: Session error %{detail}
+  err_seq_exhausted:
+    zh-CN: 发送序号已用尽
+    en: Send sequence exhausted
+  err_no_server:
+    zh-CN: UDP Session 没有服务端角色
+    en: UDP Session has no server role
+  warn_not_established:
+    zh-CN: 会话尚未建立，未发送
+    en: Session is not up; nothing sent
+  warn_foreign_session:
+    zh-CN: 收到其他会话的报文
+    en: Packet from another session
+  warn_bad_tag:
+    zh-CN: 解密失败，报文已丢弃
+    en: Decrypt failed; packet dropped
+  warn_bad_seq:
+    zh-CN: 序号不匹配，报文已丢弃
+    en: Sequence mismatch; packet dropped
+  warn_unexpected_packet:
+    zh-CN: 收到意外的会话报文
+    en: Unexpected session packet
+  warn_bad_datagram:
+    zh-CN: 报文无法解析，已丢弃
+    en: Datagram rejected
+  warn_too_long:
+    zh-CN: 报文超过 2048 字节，已丢弃
+    en: Datagram longer than 2048 bytes dropped
+  hint_waiting:
+    zh-CN: 正在握手
+    en: Handshake in progress
+  hint_established:
+    zh-CN: 会话已建立
+    en: Session established
