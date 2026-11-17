@@ -119,13 +119,18 @@ fn render_body(app: &Entity<NetAssistantApp>, _window: &Window, cx: &App) -> Div
     let selected_target = dialog.target_id.clone();
     let count = dialog.rule_count();
 
-    // 目标候选：已保存的 TCP/UDP 连接，排除来源连接与 MQTT
+    // 目标候选：已保存的 TCP/UDP 连接，排除来源连接、MQTT 与 UDP Session
+    // （后两者的报文是应用层会话数据，复制规则过去没有意义）
     let mut targets: Vec<&ConnectionConfig> = state
         .storage
         .client_connections()
         .into_iter()
         .chain(state.storage.server_connections())
-        .filter(|config| config.id() != source && config.protocol() != ConnectionType::Mqtt)
+        .filter(|config| {
+            config.id() != source
+                && config.protocol() != ConnectionType::Mqtt
+                && config.protocol() != ConnectionType::UdpSession
+        })
         .collect();
     targets.sort_by(|a, b| {
         a.protocol()

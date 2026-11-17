@@ -107,6 +107,7 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
     let is_client = state.new_connection_is_client;
     let is_edit = state.editing_connection_id.is_some();
     let is_mqtt = state.new_connection_protocol == "MQTT";
+    let is_udp_session = state.new_connection_protocol == "UDP Session";
     let show_advanced = state.show_connection_advanced;
     // 校验错误提示(内联红字): confirm_connection_form 校验失败时写入, 打开对话框时清空
     let form_error = state.connection_form_error.clone();
@@ -182,6 +183,8 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
                         // MQTT 仅客户端语义（D-5）：服务端配置不提供该选项
                         .when(is_client, |this| {
                             this.child(render_protocol_chip(app, "MQTT", is_edit, theme, cx))
+                                // UDP Session 同样只有客户端角色
+                                .child(render_protocol_chip(app, "UDP Session", is_edit, theme, cx))
                         }),
                 ),
         )
@@ -189,6 +192,10 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
         .when(is_mqtt, |this| {
             this.child(render_mqtt_base_fields(app, theme, cx))
                 .child(render_mqtt_tls_fields(app, theme, cx))
+        })
+        // UDP Session 基础区（预共享密钥 / 握手超时 / HELLO 重试）
+        .when(is_udp_session, |this| {
+            this.child(render_udp_session_fields(app, theme, cx))
         })
         // 更多设置折叠区
         .child(
@@ -304,7 +311,8 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
                                     ),
                             )
                             // 解码器（MQTT PUBLISH 天然分帧, 隐藏解码器选择; 规划 D-6）
-                            .when(!is_mqtt, |this| {
+                            // UDP Session 的数据报自带边界, 同样不需要解码器
+                            .when(!is_mqtt && !is_udp_session, |this| {
                                 this.child(render_decoder_section(app, theme, cx))
                             })
                             // MQTT 专属更多设置（Clean Session / 遗嘱消息; 规划 §8.1）
@@ -474,6 +482,51 @@ fn render_mqtt_base_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &Ap
                             cx,
                         )),
                 ),
+        )
+}
+
+/// 渲染 UDP Session 基础区（预共享密钥 / 握手超时 / HELLO 重试）
+///
+/// 预共享密钥用普通输入框（项目里没有单独的掩码组件，和 MQTT 密码同域）：
+/// 密钥本身不进日志、不进状态提示、不进错误文本。
+fn render_udp_session_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
+    let state = app.read(cx);
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(field_label(
+                    theme,
+                    t!("new_connection.udp_session_psk_label").to_string(),
+                ))
+                .child(Input::new(&state.udp_session_psk_input).cleanable(true)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(field_label(
+                    theme,
+                    t!("new_connection.udp_session_timeout_label").to_string(),
+                ))
+                .child(Input::new(&state.udp_session_timeout_input).cleanable(true)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(field_label(
+                    theme,
+                    t!("new_connection.udp_session_retries_label").to_string(),
+                ))
+                .child(Input::new(&state.udp_session_retries_input).cleanable(true)),
         )
 }
 
