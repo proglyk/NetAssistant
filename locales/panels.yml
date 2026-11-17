@@ -1017,6 +1017,18 @@ udp_session:
   close_unknown_reason:
     zh-CN: 设备结束了会话：原因未知
     en: "Device closed the session: unknown reason"
+  reply_ack:
+    zh-CN: 设备回应：%{result}
+    en: "Device reply: %{result}"
+  reply_ack_command:
+    zh-CN: 设备回应命令 %{command}：%{result}
+    en: "Device reply to %{command}: %{result}"
+  reply_error:
+    zh-CN: 设备报错：%{code}
+    en: "Device error: %{code}"
+  reply_error_command:
+    zh-CN: 设备对命令 %{command} 报错：%{code}
+    en: "Device failed %{command}: %{code}"
   hint_waiting:
     zh-CN: 正在握手
     en: Handshake in progress

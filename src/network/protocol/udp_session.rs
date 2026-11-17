@@ -18,7 +18,9 @@ use crate::network::events::{ConnectionEvent, NetCounters, ReceivedBatch, WireMe
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
 use crate::session_udp::codec::{HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, PacketType, encode};
-use crate::session_udp::machine::{Action, Command, Machine};
+use crate::session_udp::machine::{
+    Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome,
+};
 use log::{debug, error, info, warn};
 use rust_i18n::t;
 use smol::channel::{Sender, unbounded as smol_unbounded};
@@ -34,6 +36,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Buffer size of a single recv call. The UDP datagram limit is 65507 bytes, the buffer takes 65535.
 const RECV_BUFFER_SIZE: usize = 65535;
+
+/// The placeholder of a value the device did not send (a malformed answer).
+const EMPTY_VALUE: &str = "—";
 
 /// The current time in Unix seconds: it fills the header timestamp and bounds
 /// the replay window.
@@ -113,6 +118,47 @@ fn close_reason_text(reason: &str) -> String {
         "error" => t!("udp_session.close_error").to_string(),
         "" => t!("udp_session.close_unknown_reason").to_string(),
         other => t!("udp_session.close_unknown", reason = other).to_string(),
+    }
+}
+
+/// The answer of the device, in interface text (protocol §2.5.2, §2.5.3).
+///
+/// The plain text of the answer stays in the message list: this text is the
+/// short summary next to it.
+fn reply_text(reply: &CommandReply) -> String {
+    let command = reply.command.as_ref().map(command_label);
+    match (&reply.outcome, command) {
+        (ReplyOutcome::Ack { result }, Some(command)) => t!(
+            "udp_session.reply_ack_command",
+            command = command.as_str(),
+            result = result.as_deref().unwrap_or(EMPTY_VALUE)
+        )
+        .to_string(),
+        (ReplyOutcome::Ack { result }, None) => t!(
+            "udp_session.reply_ack",
+            result = result.as_deref().unwrap_or(EMPTY_VALUE)
+        )
+        .to_string(),
+        (ReplyOutcome::Error { code }, Some(command)) => t!(
+            "udp_session.reply_error_command",
+            command = command.as_str(),
+            code = code.as_deref().unwrap_or(EMPTY_VALUE)
+        )
+        .to_string(),
+        (ReplyOutcome::Error { code }, None) => t!(
+            "udp_session.reply_error",
+            code = code.as_deref().unwrap_or(EMPTY_VALUE)
+        )
+        .to_string(),
+    }
+}
+
+/// The label of a command: the name with the identifier, when the name is
+/// known.
+fn command_label(command: &PendingCommand) -> String {
+    match &command.cmd {
+        Some(cmd) => format!("{cmd} ({})", command.msg_id),
+        None => command.msg_id.clone(),
     }
 }
 
@@ -510,6 +556,20 @@ async fn apply(
                     let _ = sender
                         .send(ConnectionEvent::Warning(id.to_string(), warn_text(token)))
                         .await;
+                }
+            }
+            Action::Reply(reply) => {
+                // The plain text of the answer is already in the message list:
+                // this is the short summary next to it. A confirmation is a
+                // transient hint, a refusal stays as a warning.
+                if let Some(sender) = event_sender {
+                    let text = reply_text(&reply);
+                    let event = if matches!(reply.outcome, ReplyOutcome::Ack { .. }) {
+                        ConnectionEvent::StatusHint(id.to_string(), text)
+                    } else {
+                        ConnectionEvent::Warning(id.to_string(), text)
+                    };
+                    let _ = sender.send(event).await;
                 }
             }
         }
@@ -1228,5 +1288,130 @@ mod tests {
         );
         let err = server.start().await.unwrap_err();
         assert_eq!(err.to_string(), t!("udp_session.err_no_server").to_string());
+    }
+
+    /// The command envelope of the user: the client sends it as it is.
+    const COMMAND: &[u8] = br#"{"protocol_version":"1.0","msg_type":"command","msg_id":"cmd-1","ts_utc":"2026-11-17T18:00:00.000Z","seq":1,"source":"app","payload":{"cmd":"get_status","scope":"device","ttl_sec":30,"params":{}}}"#;
+
+    /// The refusal of the device: the answer to a text that is not a command.
+    const ERROR: &[u8] = br#"{"protocol_version":"1.0","msg_type":"error","device_id":"","ts_utc":"1970-01-01T00:00:00.000Z","seq":1,"source":"device","payload":{"code":"E_INVALID_CMD","severity":"error","message":"The command is not a valid message","retryable":false}}"#;
+
+    /// The confirmation of the device: the answer that names the command.
+    const ACK: &[u8] = br#"{"protocol_version":"1.0","msg_type":"ack","correlation_id":"cmd-1","device_id":"dev_1","ts_utc":"2026-11-17T18:00:01.000Z","seq":1,"source":"device","payload":{"result":"applied","device_state":"idle"}}"#;
+
+    #[tokio::test]
+    async fn loopback_device_error_is_shown_as_a_warning() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+        let (nonce_a, client_addr, _write_tx) = establish(&peer, &rx).await;
+
+        peer_send_data(&peer, client_addr, nonce_a, 1, ERROR).await;
+
+        // The plain text of the answer goes into the message list as it is.
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        match ev {
+            ConnectionEvent::MessagesReceived(_, batch) => {
+                assert_eq!(&*batch.messages[0].raw_data, ERROR);
+            }
+            other => panic!("expected MessagesReceived, got {other:?}"),
+        }
+
+        // The parsed refusal is a warning: the session stays alive.
+        let (ev, others) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Warning(..))).await;
+        match ev {
+            ConnectionEvent::Warning(_, text) => {
+                let code = "E_INVALID_CMD";
+                assert_eq!(
+                    text,
+                    t!("udp_session.reply_error", code = code).to_string(),
+                    "the code of the error is shown"
+                );
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::Error(..))),
+            "a refusal of the device is not a failure of the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_ack_is_correlated_with_the_command() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+        let (nonce_a, client_addr, write_tx) = establish(&peer, &rx).await;
+
+        // The user sends the command envelope: it goes to the wire as it is.
+        write_tx
+            .send(WireMessage::inherit(COMMAND.to_vec()))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = decode(&buf[..n]).unwrap();
+        assert_eq!(frame.header.packet_type, PacketType::Data);
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            panic!("expected an encrypted body")
+        };
+        let plain = aes_gcm_decrypt(
+            &session_key(nonce_a),
+            nonce,
+            &header_bytes(&frame.header),
+            ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain, COMMAND, "the envelope must not be rebuilt");
+
+        // The device confirms the command and names it.
+        peer_send_data(&peer, client_addr, nonce_a, 1, ACK).await;
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        match ev {
+            ConnectionEvent::MessagesReceived(_, batch) => {
+                assert_eq!(&*batch.messages[0].raw_data, ACK);
+            }
+            other => panic!("expected MessagesReceived, got {other:?}"),
+        }
+
+        // The confirmation names the command it belongs to.
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::StatusHint(..))).await;
+        match ev {
+            ConnectionEvent::StatusHint(_, text) => {
+                let command = "get_status (cmd-1)";
+                let result = "applied";
+                assert_eq!(
+                    text,
+                    t!(
+                        "udp_session.reply_ack_command",
+                        command = command,
+                        result = result
+                    )
+                    .to_string()
+                );
+            }
+            other => panic!("expected StatusHint, got {other:?}"),
+        }
     }
 }

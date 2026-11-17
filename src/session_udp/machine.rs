@@ -8,11 +8,15 @@
 //! Handshake (protocol §5.4, spec B):
 //! `HELLO` → `CHALLENGE` → `RESPONSE` → `SESSION_OK`, or `SESSION_ERR`.
 //! Session (spec C): encrypted `DATA`, `PUSH` and `CLOSE`.
+//! Answers (spec E): the plain text of a `DATA` frame is parsed as the
+//! envelope of a business message, and the answer is correlated with the
+//! command it belongs to.
 
 use crate::session_udp::codec::{
-    Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, Frame, HANDSHAKE_NONCE_LEN, HKDF_INFO,
-    Header, MAX_PLAINTEXT, PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes,
-    nonce_matches, proof_a_input, proof_b_input,
+    Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, Envelope, Frame, HANDSHAKE_NONCE_LEN,
+    HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR, PacketType,
+    TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes, nonce_matches, proof_a_input,
+    proof_b_input,
 };
 use crate::session_udp::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
@@ -22,6 +26,15 @@ use std::fmt;
 /// Body of the outgoing `CLOSE`: the client only closes on an explicit
 /// disconnect, and the reason says so (protocol §5.9).
 const CLOSE_BODY_USER_DISCONNECT: &[u8] = br#"{"reason":"user_disconnect"}"#;
+
+/// Results that finish a command (protocol §2.5.2).
+///
+/// The other results (`received`, `scheduled`) are intermediate: the final
+/// answer of the command is still to come.
+const TERMINAL_RESULTS: &[&str] = &["applied", "failed", "rejected", "expired", "superseded"];
+
+/// How many commands the client remembers while it waits for their answers.
+const MAX_PENDING_COMMANDS: usize = 32;
 
 /// State machine input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +66,42 @@ pub enum Command {
     },
 }
 
+/// A command of the application that waits for an answer (protocol §2.1).
+///
+/// The client remembers the commands it sends as envelopes: the answer of the
+/// device names the command in `correlation_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCommand {
+    /// The `msg_id` of the command.
+    pub msg_id: String,
+    /// The name of the command, when the envelope carries `payload.cmd`.
+    pub cmd: Option<String>,
+}
+
+/// What the device answered (protocol §2.5.2, §2.5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyOutcome {
+    /// The device confirmed the command: "applied", "rejected", ...
+    Ack {
+        /// The result of the answer.
+        result: Option<String>,
+    },
+    /// The device refused the command: "E_INVALID_CMD", ...
+    Error {
+        /// The code of the error.
+        code: Option<String>,
+    },
+}
+
+/// An answer of the device, bound to the command it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandReply {
+    /// What the device answered.
+    pub outcome: ReplyOutcome,
+    /// The command the answer belongs to; known when the correlation matched.
+    pub command: Option<PendingCommand>,
+}
+
 /// State machine output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -74,6 +123,11 @@ pub enum Action {
     },
     /// Non-fatal warning: the session stays alive.
     Warn(String),
+    /// The device answered a command (protocol §2.5.2, §2.5.3).
+    ///
+    /// The plain text of the frame goes to the journal as well: this action
+    /// carries the parsed answer, not the text.
+    Reply(CommandReply),
 }
 
 /// Internal state.
@@ -100,6 +154,8 @@ enum State {
         tx_seq: u32,
         /// Sequence number of the last accepted frame.
         rx_seq: Option<u32>,
+        /// The commands that wait for an answer.
+        pending: Vec<PendingCommand>,
     },
     Closed,
     Failed,
@@ -314,6 +370,8 @@ impl Machine {
                         // client starts there too.
                         tx_seq: 1,
                         rx_seq: None,
+                        // No command has been sent yet.
+                        pending: Vec::new(),
                     },
                     vec![Action::Established { session_id }],
                 )
@@ -382,7 +440,22 @@ impl Machine {
             *rx_seq = Some(frame.header.seq);
         }
         match frame.header.packet_type {
-            PacketType::Data | PacketType::Push => vec![Action::Deliver(plain)],
+            PacketType::Data => {
+                // The plain text goes into the journal as it is, and the
+                // answer of the device is parsed aside: an "ack" or an
+                // "error" is a reply to a command.
+                let reply = self.take_reply(&plain);
+                let mut actions = vec![Action::Deliver(plain)];
+                if let Some(reply) = reply {
+                    actions.push(Action::Reply(reply));
+                }
+                actions
+            }
+            PacketType::Push => {
+                // The body of a push is not parsed: the snapshots and the
+                // events are not in the scope of the client yet (spec F).
+                vec![Action::Deliver(plain)]
+            }
             PacketType::Close => {
                 // The peer closed the session: the reason is read from the
                 // decrypted body, and an unreadable body does not keep the
@@ -409,6 +482,81 @@ impl Machine {
                     .map(str::to_string)
             })
             .unwrap_or_default()
+    }
+
+    /// Remember a command of the application: the answer of the device names
+    /// its `msg_id` in `correlation_id` (protocol §2.1).
+    ///
+    /// The bytes go to the wire as they are: the envelope is not rebuilt and
+    /// no field is added.
+    fn remember_command(&mut self, bytes: &[u8]) {
+        let Some(envelope) = Envelope::parse(bytes) else {
+            return;
+        };
+        if !envelope.is_command() {
+            return;
+        }
+        let cmd = envelope.command_name().map(str::to_string);
+        let Some(msg_id) = envelope.msg_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let command = PendingCommand { msg_id, cmd };
+        let State::Established { pending, .. } = &mut self.state else {
+            return;
+        };
+        // The same `msg_id` twice: the newer command replaces the older one.
+        pending.retain(|known| known.msg_id != command.msg_id);
+        // The list is bounded: a command without an answer does not grow it
+        // forever.
+        if pending.len() >= MAX_PENDING_COMMANDS {
+            pending.remove(0);
+        }
+        pending.push(command);
+    }
+
+    /// The answer of the device, parsed from the plain text of a `DATA` frame.
+    ///
+    /// The answer is bound to the command it belongs to: the `correlation_id`
+    /// of the answer names the `msg_id` of the command.
+    fn take_reply(&mut self, plain: &[u8]) -> Option<CommandReply> {
+        let envelope = Envelope::parse(plain)?;
+        let outcome = match envelope.msg_type.as_str() {
+            MSG_TYPE_ACK => ReplyOutcome::Ack {
+                result: envelope.result().map(str::to_string),
+            },
+            MSG_TYPE_ERROR => ReplyOutcome::Error {
+                code: envelope.error_code().map(str::to_string),
+            },
+            _ => return None,
+        };
+        let command = envelope
+            .correlation_id
+            .as_deref()
+            .and_then(|correlation_id| self.take_pending(correlation_id, &outcome));
+        Some(CommandReply { outcome, command })
+    }
+
+    /// Take the remembered command with this `msg_id`.
+    ///
+    /// A command is answered for good only by a terminal result or by an
+    /// error: an intermediate result leaves the command waiting for its final
+    /// answer (protocol §2.5.2).
+    fn take_pending(&mut self, msg_id: &str, outcome: &ReplyOutcome) -> Option<PendingCommand> {
+        let State::Established { pending, .. } = &mut self.state else {
+            return None;
+        };
+        let index = pending.iter().position(|known| known.msg_id == msg_id)?;
+        let terminal = match outcome {
+            ReplyOutcome::Error { .. } => true,
+            ReplyOutcome::Ack { result } => result
+                .as_deref()
+                .is_some_and(|result| TERMINAL_RESULTS.contains(&result)),
+        };
+        if terminal {
+            return Some(pending.remove(index));
+        }
+        // The command is not answered for good: it stays in the list.
+        Some(pending[index].clone())
     }
 
     /// The difference of two timestamps, in seconds; the difference fits in
@@ -473,6 +621,9 @@ impl Machine {
             self.state = State::Failed;
             return vec![Action::Failed("seq exhausted".to_string())];
         }
+        // A command envelope is remembered: the answer of the device names
+        // its `msg_id` in `correlation_id` (protocol §2.1).
+        self.remember_command(&bytes);
         let frame = Self::encrypt_frame(
             PacketType::Data,
             &key,
@@ -1124,6 +1275,58 @@ mod tests {
         );
     }
 
+    /// The command envelope of the user: the client sends it as it is.
+    fn command_envelope(msg_id: &str, cmd: &str) -> Vec<u8> {
+        serde_json::json!({
+            "protocol_version": "1.0",
+            "msg_type": "command",
+            "msg_id": msg_id,
+            "ts_utc": "2026-11-17T18:00:00.000Z",
+            "seq": 1,
+            "source": "app",
+            "payload": {"cmd": cmd, "scope": "device", "ttl_sec": 30, "params": {}}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The answer of the device: an ack with an optional correlation.
+    fn ack_envelope(correlation_id: Option<&str>, result: &str) -> Vec<u8> {
+        let mut envelope = serde_json::json!({
+            "protocol_version": "1.0",
+            "msg_type": "ack",
+            "device_id": "dev_1",
+            "ts_utc": "2026-11-17T18:00:01.000Z",
+            "seq": 1,
+            "source": "device",
+            "payload": {"result": result, "device_state": "idle"}
+        });
+        if let Some(correlation_id) = correlation_id {
+            envelope["correlation_id"] = serde_json::Value::String(correlation_id.to_string());
+        }
+        envelope.to_string().into_bytes()
+    }
+
+    /// The error of the device: the answer to a text that is not a command.
+    fn error_envelope(code: &str) -> Vec<u8> {
+        serde_json::json!({
+            "protocol_version": "1.0",
+            "msg_type": "error",
+            "device_id": "",
+            "ts_utc": "1970-01-01T00:00:00.000Z",
+            "seq": 1,
+            "source": "device",
+            "payload": {
+                "code": code,
+                "severity": "error",
+                "message": "The command is not a valid message",
+                "retryable": false
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     #[test]
     fn unknown_close_reason_still_closes_the_session() {
         let mut m = Machine::new();
@@ -1148,4 +1351,191 @@ mod tests {
                 .any(|a| matches!(a, Action::Closed { reason: Some(r) } if r.is_empty()))
         );
     }
+
+    #[test]
+    fn an_ack_is_parsed_as_a_reply() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let plain = ack_envelope(None, "applied");
+        let frame = device_frame(PacketType::Data, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        // The plain text goes to the journal as it is.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == &plain))
+        );
+        // And the answer is parsed aside.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { result: Some(result) },
+                command: None,
+            }) if result.as_str() == "applied"
+        )));
+    }
+
+    #[test]
+    fn an_error_is_parsed_with_its_code() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let plain = error_envelope("E_INVALID_CMD");
+        let frame = device_frame(PacketType::Data, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Error { code: Some(code) },
+                command: None,
+            }) if code.as_str() == "E_INVALID_CMD"
+        )));
+    }
+
+    #[test]
+    fn a_reply_is_correlated_with_the_command() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // The user sends a command envelope: the bytes go to the wire as they
+        // are.
+        let command = command_envelope("cmd-1", "get_status");
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: command.clone(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let frame = sent(&actions);
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            panic!("expected an encrypted body");
+        };
+        let plain = aes_gcm_decrypt(
+            &session_key(),
+            nonce,
+            &header_bytes(&frame.header),
+            ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain, command, "the envelope must not be rebuilt");
+
+        // The device answers and names the command.
+        let plain = ack_envelope(Some("cmd-1"), "applied");
+        let frame = device_frame(PacketType::Data, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: Some(PendingCommand { msg_id, cmd }),
+            }) if msg_id == "cmd-1" && cmd.as_deref() == Some("get_status")
+        )));
+    }
+
+    #[test]
+    fn a_reply_without_a_known_command_names_no_command() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // A text that is not an envelope at all.
+        let frame = device_frame(PacketType::Data, 1, NOW, b"hello");
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == b"hello"))
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Reply(_))),
+            "a plain text is not a reply"
+        );
+
+        // An answer whose correlation names an unknown command.
+        let plain = ack_envelope(Some("other"), "applied");
+        let frame = device_frame(PacketType::Data, 2, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: None,
+            })
+        )));
+    }
+
+    #[test]
+    fn an_intermediate_result_keeps_the_command() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let command = command_envelope("cmd-2", "start");
+        let _ = m.handle(
+            Command::UserBytes {
+                bytes: command,
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        // "received" is intermediate: the final answer is still to come.
+        let plain = ack_envelope(Some("cmd-2"), "received");
+        let frame = device_frame(PacketType::Data, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: Some(PendingCommand { msg_id, .. }),
+            }) if msg_id == "cmd-2"
+        )));
+
+        // The terminal answer is still correlated with the same command.
+        let plain = ack_envelope(Some("cmd-2"), "applied");
+        let frame = device_frame(PacketType::Data, 2, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: Some(PendingCommand { msg_id, .. }),
+            }) if msg_id == "cmd-2"
+        )));
+
+        // The terminal answer finished the command: the next one names no
+        // command.
+        let plain = ack_envelope(Some("cmd-2"), "applied");
+        let frame = device_frame(PacketType::Data, 3, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: None,
+            })
+        )));
+    }
+
+    #[test]
+    fn the_pending_list_is_bounded() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        for index in 0..(MAX_PENDING_COMMANDS + 2) {
+            let command = command_envelope(&format!("cmd-{index}"), "get_status");
+            let _ = m.handle(
+                Command::UserBytes {
+                    bytes: command,
+                    nonce_tail: tail(),
+                },
+                NOW,
+            );
+        }
+        // The oldest command was forgotten: its answer names no command.
+        let plain = ack_envelope(Some("cmd-0"), "applied");
+        let frame = device_frame(PacketType::Data, 1, NOW, &plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: None,
+            })
+        )));
+    }
+
 }

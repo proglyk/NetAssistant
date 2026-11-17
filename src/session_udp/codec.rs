@@ -14,6 +14,10 @@
 //! The frame boundary is one datagram: there is no total-length field, and
 //! trailing bytes are never trimmed — a frame with trailing bytes is a bad
 //! frame.
+//!
+//! The JSON envelope of a business message (protocol §2.1) lives here too: it
+//! is not a separate packet, but the plain text of a `DATA` frame, and the
+//! client needs its fields to recognise answers and to correlate them.
 
 use crate::session_udp::crypto::{NONCE_LEN, TAG_LEN};
 use std::fmt;
@@ -362,6 +366,88 @@ pub fn proof_a_input(
     out
 }
 
+/// Message type of a command (protocol §2.1).
+pub const MSG_TYPE_COMMAND: &str = "command";
+/// Message type of a positive answer (protocol §2.1).
+pub const MSG_TYPE_ACK: &str = "ack";
+/// Message type of a negative answer (protocol §2.1).
+pub const MSG_TYPE_ERROR: &str = "error";
+
+/// The JSON envelope of a business message (protocol §2.1).
+///
+/// The envelope is not a separate packet: it is the plain text of a `DATA`
+/// frame. Only the fields the client needs are read; the unknown fields are
+/// ignored (protocol §2.4.6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Envelope {
+    /// The type of the message: "command", "ack", "error", "status", "event".
+    pub msg_type: String,
+    /// The identifier of the message.
+    pub msg_id: Option<String>,
+    /// The identifier of the command the message answers.
+    pub correlation_id: Option<String>,
+    /// The payload of the message (protocol §2.5).
+    pub payload: serde_json::Value,
+}
+
+impl Envelope {
+    /// Parse the plain text of a frame as an envelope.
+    ///
+    /// `None` means the text is not an envelope: it is not a JSON object with a
+    /// string `msg_type`. Such a text is shown as it is.
+    pub fn parse(text: &[u8]) -> Option<Self> {
+        let value = serde_json::from_slice::<serde_json::Value>(text).ok()?;
+        let object = value.as_object()?;
+        // The type is the only mandatory field of the envelope the client
+        // reads: without it the text is not an envelope.
+        let msg_type = object.get("msg_type")?.as_str()?.to_string();
+        let msg_id = object
+            .get("msg_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        // The correlation may be absent or null: both mean "no command".
+        let correlation_id = object
+            .get("correlation_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let payload = object
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        Some(Envelope {
+            msg_type,
+            msg_id,
+            correlation_id,
+            payload,
+        })
+    }
+
+    /// Whether the envelope is a command of the application.
+    pub fn is_command(&self) -> bool {
+        self.msg_type == MSG_TYPE_COMMAND
+    }
+
+    /// Whether the envelope is an answer of the device: an ack or an error.
+    pub fn is_reply(&self) -> bool {
+        self.msg_type == MSG_TYPE_ACK || self.msg_type == MSG_TYPE_ERROR
+    }
+
+    /// The name of the command, when the payload carries one (§2.5.1).
+    pub fn command_name(&self) -> Option<&str> {
+        self.payload.get("cmd").and_then(|value| value.as_str())
+    }
+
+    /// The result of an answer (§2.5.2).
+    pub fn result(&self) -> Option<&str> {
+        self.payload.get("result").and_then(|value| value.as_str())
+    }
+
+    /// The code of an error (§2.5.3).
+    pub fn error_code(&self) -> Option<&str> {
+        self.payload.get("code").and_then(|value| value.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +747,69 @@ mod tests {
         assert_eq!(HKDF_INFO.len(), 23);
         assert_eq!(HKDF_INFO, b"hiot-udp-v1-session-key");
         assert!(!HKDF_INFO.contains(&0));
+    }
+
+    #[test]
+    fn envelope_reads_the_fields_of_the_contract() {
+        // The answer of the device (protocol §2.1, §5.12).
+        let text = br#"{"protocol_version":"1.0","msg_type":"ack","msg_id":"a-1",
+            "correlation_id":"c-1","device_id":"dev_1","ts_utc":"2026-07-19T18:05:01.000Z",
+            "seq":2,"source":"device","payload":{"result":"applied","device_state":"idle"}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.msg_type, MSG_TYPE_ACK);
+        assert!(envelope.is_reply());
+        assert!(!envelope.is_command());
+        assert_eq!(envelope.msg_id.as_deref(), Some("a-1"));
+        assert_eq!(envelope.correlation_id.as_deref(), Some("c-1"));
+        assert_eq!(envelope.result(), Some("applied"));
+        assert_eq!(envelope.command_name(), None);
+    }
+
+    #[test]
+    fn envelope_of_a_command_carries_the_name() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"command","msg_id":"c-1",
+            "ts_utc":"2026-07-19T18:05:00.000Z","seq":1,"source":"app",
+            "payload":{"cmd":"get_status","scope":"device","ttl_sec":30,"params":{}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert!(envelope.is_command());
+        assert!(!envelope.is_reply());
+        assert_eq!(envelope.command_name(), Some("get_status"));
+        assert_eq!(envelope.msg_id.as_deref(), Some("c-1"));
+    }
+
+    #[test]
+    fn an_error_envelope_carries_the_code() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"error","device_id":"",
+            "ts_utc":"1970-01-01T00:00:00.000Z","seq":1,"source":"device",
+            "payload":{"code":"E_INVALID_CMD","severity":"error",
+            "message":"The command is not a valid message","retryable":false}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert!(envelope.is_reply());
+        assert_eq!(envelope.error_code(), Some("E_INVALID_CMD"));
+        // The answer to a text that is not a command names no command.
+        assert_eq!(envelope.msg_id, None);
+        assert_eq!(envelope.correlation_id, None);
+    }
+
+    #[test]
+    fn a_text_without_a_type_is_not_an_envelope() {
+        // A plain command line is not an envelope.
+        assert!(Envelope::parse(b"get_status").is_none());
+        // A JSON object without a type is not an envelope either.
+        assert!(Envelope::parse(br#"{"a":1}"#).is_none());
+        // A type that is not a string is not an envelope.
+        assert!(Envelope::parse(br#"{"msg_type":1}"#).is_none());
+        // Broken JSON is not an envelope.
+        assert!(Envelope::parse(b"{").is_none());
+        // An empty body is not an envelope.
+        assert!(Envelope::parse(b"").is_none());
+    }
+
+    #[test]
+    fn a_null_correlation_means_no_command() {
+        let text = br#"{"msg_type":"ack","correlation_id":null,"payload":{}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.correlation_id, None);
+        assert_eq!(envelope.result(), None);
     }
 }
