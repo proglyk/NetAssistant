@@ -1,20 +1,25 @@
-//! UDP Session client: the HELLO / CHALLENGE / RESPONSE / SESSION_OK
-//! handshake.
+//! UDP Session client: HELLO / CHALLENGE / RESPONSE / SESSION_OK handshake plus
+//! an AES-256-GCM session.
 //!
 //! Differences from the plain UDP client:
 //! - the handshake runs in the protocol layer; user bytes never reach the wire
-//!   before it is over (clear text must not leak).
+//!   before it is over (clear text must not leak);
+//! - session data travels in DATA frames (ciphertext plus a 16-byte GCM tag),
+//!   and only the decrypted plain text reaches the log;
+//! - reply rules stay out: rules on plain text would bypass GCM authentication.
 //!
 //! The byte contract lives in `src/session_udp/codec.rs` and in
-//! `docs-dev/specs/2026-11-17-udp-session-b-handshake.md` (handshake).
+//! `docs-dev/specs/2026-11-17-udp-session-b-handshake.md` (handshake) and
+//! `docs-dev/specs/2026-11-17-udp-session-c-data-close.md` (DATA / CLOSE).
 
 use crate::config::connection::{ClientConfig, ServerConfig, TrailerSetting};
-use crate::network::events::{ConnectionEvent, NetCounters};
+use crate::message::{Message, MessageDirection, MessageType};
+use crate::network::events::{ConnectionEvent, NetCounters, ReceivedBatch, WireMessage};
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
-use crate::session_udp::codec::{HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, encode};
+use crate::session_udp::codec::{HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, PacketType, encode};
 use crate::session_udp::machine::{Action, Command, Machine};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rust_i18n::t;
 use smol::channel::{Sender, unbounded as smol_unbounded};
 use std::any::Any;
@@ -30,7 +35,8 @@ use tokio_util::sync::CancellationToken;
 /// Buffer size of a single recv call. The UDP datagram limit is 65507 bytes, the buffer takes 65535.
 const RECV_BUFFER_SIZE: usize = 65535;
 
-/// The current time in Unix seconds: it fills the header timestamp.
+/// The current time in Unix seconds: it fills the header timestamp and bounds
+/// the replay window.
 ///
 /// The state machine has no clock of its own: time arrives from outside, so
 /// the tests stay deterministic.
@@ -39,6 +45,21 @@ fn unix_now() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
         .unwrap_or(0)
+}
+
+/// The five random bytes of the nonce tail.
+///
+/// The random source is outside the state machine too: the machine is pure
+/// logic.
+fn nonce_tail() -> Option<[u8; 5]> {
+    let mut tail = [0u8; 5];
+    match getrandom::fill(&mut tail) {
+        Ok(()) => Some(tail),
+        Err(e) => {
+            error!("[UDP Session] failed to generate random bytes: {:?}", e);
+            None
+        }
+    }
 }
 
 /// Translate a failure token of the state machine into interface text.
@@ -62,7 +83,36 @@ fn fail_text(token: &str) -> String {
         "empty psk" => t!("udp_session.err_empty_psk").to_string(),
         "handshake timeout" => t!("udp_session.err_handshake_timeout").to_string(),
         "bad proof" => t!("udp_session.err_bad_proof").to_string(),
+        "seq exhausted" => t!("udp_session.err_seq_exhausted").to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Translate a warning token of the state machine into interface text.
+fn warn_text(token: &str) -> String {
+    match token {
+        "not established" => t!("udp_session.warn_not_established").to_string(),
+        "foreign session" => t!("udp_session.warn_foreign_session").to_string(),
+        "bad nonce" => t!("udp_session.warn_bad_nonce").to_string(),
+        "timestamp out of window" => t!("udp_session.warn_timestamp_out_of_window").to_string(),
+        "bad tag" => t!("udp_session.warn_bad_tag").to_string(),
+        "bad seq" => t!("udp_session.warn_bad_seq").to_string(),
+        "payload too large" => t!("udp_session.warn_payload_too_large").to_string(),
+        "unexpected packet" => t!("udp_session.warn_unexpected_packet").to_string(),
+        "bad datagram" => t!("udp_session.warn_bad_datagram").to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The close reason of the peer, in interface text (protocol §5.9).
+fn close_reason_text(reason: &str) -> String {
+    match reason {
+        "user_disconnect" => t!("udp_session.close_user_disconnect").to_string(),
+        "timeout" => t!("udp_session.close_timeout").to_string(),
+        "secret_rotated" => t!("udp_session.close_secret_rotated").to_string(),
+        "error" => t!("udp_session.close_error").to_string(),
+        "" => t!("udp_session.close_unknown_reason").to_string(),
+        other => t!("udp_session.close_unknown", reason = other).to_string(),
     }
 }
 
@@ -73,11 +123,11 @@ pub struct UdpSessionClient {
     net_counters: Option<NetCounters>,
     is_connected: bool,
     cancel_token: CancellationToken,
-    /// Runtime "append trailer" setting: this connection does not read it (the session payload
+    /// Runtime "append trailer" setting: this connection does not read it (the DATA payload
     /// must not be polluted with appended bytes).
     _trailer: TrailerSetting,
     /// Shared reply rules state: this connection does not call them (rules must not act on
-    /// session data).
+    /// ciphertext).
     _reply_rules: Arc<ReplyRulesStore>,
 }
 
@@ -196,10 +246,17 @@ impl NetworkConnection for UdpSessionClient {
                 }
             }
 
+            let (tx, rx) = smol_unbounded::<WireMessage>();
             let id = config.id.clone();
             if let Some(sender) = &event_sender {
                 let _ = sender
                     .send(ConnectionEvent::Connected(id.clone(), local_addr))
+                    .await;
+                let _ = sender
+                    .send(ConnectionEvent::ClientWriteSenderReady(
+                        id.clone(),
+                        tx.clone(),
+                    ))
                     .await;
                 let _ = sender
                     .send(ConnectionEvent::StatusHint(
@@ -208,10 +265,12 @@ impl NetworkConnection for UdpSessionClient {
                     ))
                     .await;
             }
+            drop(tx);
 
             let cancel = cancel_token.clone();
             let event_sender_loop = event_sender.clone();
             let net_counters_loop = net_counters.clone();
+            let peer = server_addr;
             tokio::spawn(async move {
                 let mut buf = [0u8; RECV_BUFFER_SIZE];
                 // The handshake timer is armed while waiting only: after the session is established
@@ -223,12 +282,17 @@ impl NetworkConnection for UdpSessionClient {
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => {
+                            // An encrypted CLOSE goes out first, so the peer
+                            // knows the user left
+                            let tail = nonce_tail().unwrap_or([0u8; 5]);
+                            let actions = machine.handle(Command::UserDisconnect { nonce_tail: tail }, unix_now());
+                            let _ = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
                             break;
                         }
                         _ = &mut sleep, if waiting => {
                             let actions = machine.handle(Command::Tick, unix_now());
                             sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
-                            let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
+                            let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
                             if flow == Flow::Established {
                                 waiting = false;
                             }
@@ -251,7 +315,7 @@ impl NetworkConnection for UdpSessionClient {
                                         continue;
                                     }
                                     let actions = machine.on_datagram(&buf[..n], unix_now());
-                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
+                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
                                     if flow == Flow::Established {
                                         waiting = false;
                                     }
@@ -269,6 +333,37 @@ impl NetworkConnection for UdpSessionClient {
                                     }
                                     break;
                                 }
+                            }
+                        }
+                        incoming = rx.recv() => {
+                            match incoming {
+                                Ok(wire) => {
+                                    // The nonce tail needs five random bytes:
+                                    // without a random source nothing is sent
+                                    let Some(tail) = nonce_tail() else {
+                                        if let Some(sender) = &event_sender_loop {
+                                            let _ = sender.send(ConnectionEvent::Warning(
+                                                id.clone(),
+                                                t!("udp_session.warn_random_failed").to_string(),
+                                            )).await;
+                                        }
+                                        continue;
+                                    };
+                                    // The user bytes enter the state machine as they are: no trailer is appended, the
+                                                                        // finalized flag is not read.
+                                    let actions = machine.handle(
+                                        Command::UserBytes { bytes: wire.data().to_vec(), nonce_tail: tail },
+                                        unix_now(),
+                                    );
+                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
+                                    if flow == Flow::Established {
+                                        waiting = false;
+                                    }
+                                    if flow == Flow::Stop {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         }
                     }
@@ -317,6 +412,7 @@ async fn apply(
     socket: &UdpSocket,
     event_sender: &Option<Sender<ConnectionEvent>>,
     id: &str,
+    peer: &SocketAddr,
     net_counters: &Option<NetCounters>,
 ) -> Flow {
     let mut flow = Flow::Continue;
@@ -332,6 +428,11 @@ async fn apply(
                         }
                     }
                     Err(e) => {
+                        // A failed Close send does not change the outcome: the session was over anyway.
+                        if frame.header.packet_type == PacketType::Close {
+                            debug!("[UDP Session] failed to send Close: {:?}", e);
+                            continue;
+                        }
                         error!("[UDP Session] failed to send a packet: {:?}", e);
                         if let Some(sender) = event_sender {
                             let _ = sender
@@ -343,6 +444,26 @@ async fn apply(
                         }
                         flow = Flow::Stop;
                     }
+                }
+            }
+            Action::Deliver(plain) => {
+                // The decrypted plain text goes into the message list; handshake packets do not.
+                let mut batch = ReceivedBatch::with_capacity(1);
+                let len = plain.len() as u64;
+                batch.count = 1;
+                batch.bytes = len;
+                batch.messages.push(
+                    Message::new(MessageDirection::Received, plain.clone(), MessageType::Text)
+                        .with_source(peer.to_string()),
+                );
+                if let Some(c) = net_counters {
+                    c.add_received(1);
+                    c.add_received_bytes(len);
+                }
+                if let Some(sender) = event_sender {
+                    let _ = sender
+                        .send(ConnectionEvent::MessagesReceived(id.to_string(), batch))
+                        .await;
                 }
             }
             Action::Established { .. } => {
@@ -364,6 +485,32 @@ async fn apply(
                         .await;
                 }
                 flow = Flow::Stop;
+            }
+            Action::Closed { reason } => {
+                if let Some(sender) = event_sender {
+                    let _ = sender
+                        .send(ConnectionEvent::Disconnected(id.to_string()))
+                        .await;
+                    // The close reason goes after the disconnect: the disconnect handling clears the
+                    // status hint.
+                    if let Some(reason) = reason {
+                        let _ = sender
+                            .send(ConnectionEvent::StatusHint(
+                                id.to_string(),
+                                close_reason_text(&reason),
+                            ))
+                            .await;
+                    }
+                }
+                flow = Flow::Stop;
+            }
+            Action::Warn(token) => {
+                warn!("[UDP Session] {}", token);
+                if let Some(sender) = event_sender {
+                    let _ = sender
+                        .send(ConnectionEvent::Warning(id.to_string(), warn_text(token)))
+                        .await;
+                }
             }
         }
         if flow == Flow::Stop {
@@ -418,12 +565,13 @@ impl NetworkServer for UdpSessionServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::connection::{ConnectionType, UdpSessionSettings};
+    use crate::config::connection::{ConnectionType, TrailerKind, UdpSessionSettings};
     use crate::reply::model::{ReplyPayload, ReplyRule, ReplyRulesConfig};
     use crate::session_udp::codec::{
-        Body, Frame, Header, PacketType, decode, proof_a_input, proof_b_input,
+        Body, DIRECTION_ESP_TO_APP, Frame, HKDF_INFO, Header, build_nonce, decode, header_bytes,
+        proof_a_input, proof_b_input,
     };
-    use crate::session_udp::crypto::hmac_sha256;
+    use crate::session_udp::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256};
     use smol::channel::Receiver;
     use std::collections::HashMap;
 
@@ -581,8 +729,78 @@ mod tests {
         peer.send_to(&encode(&frame), client_addr).await.unwrap();
     }
 
+    /// HKDF salt = nonce_a ‖ nonce_b.
+    fn salt(nonce_a: [u8; HANDSHAKE_NONCE_LEN]) -> Vec<u8> {
+        nonce_a.into_iter().chain(NONCE_B).collect()
+    }
+
+    fn session_key(nonce_a: [u8; HANDSHAKE_NONCE_LEN]) -> [u8; 32] {
+        hkdf_sha256(PSK.as_bytes(), &salt(nonce_a), HKDF_INFO)
+    }
+
+    /// The peer sends an encrypted session frame (DATA or CLOSE).
+    async fn peer_send_encrypted(
+        peer: &UdpSocket,
+        client_addr: SocketAddr,
+        nonce_a: [u8; HANDSHAKE_NONCE_LEN],
+        packet_type: PacketType,
+        seq: u32,
+        plain: &[u8],
+    ) {
+        let header = Header {
+            packet_type,
+            session_id: SESSION_ID,
+            seq,
+            timestamp: unix_now(),
+        };
+        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq, [0xCD; 5]);
+        let aad = header_bytes(&header);
+        let ciphertext = aes_gcm_encrypt(&session_key(nonce_a), &nonce, &aad, plain).unwrap();
+        let frame = Frame {
+            header,
+            body: Body::Encrypted { nonce, ciphertext },
+        };
+        peer.send_to(&encode(&frame), client_addr).await.unwrap();
+    }
+
+    /// The peer sends a DATA packet.
+    async fn peer_send_data(
+        peer: &UdpSocket,
+        client_addr: SocketAddr,
+        nonce_a: [u8; HANDSHAKE_NONCE_LEN],
+        seq: u32,
+        plain: &[u8],
+    ) {
+        peer_send_encrypted(peer, client_addr, nonce_a, PacketType::Data, seq, plain).await;
+    }
+
+    /// Establish the session: handshake plus the write channel.
+    async fn establish(
+        peer: &UdpSocket,
+        rx: &Receiver<ConnectionEvent>,
+    ) -> ([u8; HANDSHAKE_NONCE_LEN], SocketAddr, Sender<WireMessage>) {
+        let (nonce_a, client_addr, _) = recv_hello(peer).await;
+        peer_send_challenge(peer, client_addr, nonce_a).await;
+        peer_recv_response(peer, nonce_a).await;
+        peer_send_session_ok(peer, client_addr).await;
+
+        let write_tx = loop {
+            if let ConnectionEvent::ClientWriteSenderReady(_, s) = next_event(rx).await {
+                break s;
+            }
+        };
+        let hint_established = t!("udp_session.hint_established").to_string();
+        let (ev, _) = wait_for(
+            rx,
+            |e| matches!(e, ConnectionEvent::StatusHint(_, t) if *t == hint_established),
+        )
+        .await;
+        assert!(matches!(ev, ConnectionEvent::StatusHint(..)));
+        (nonce_a, client_addr, write_tx)
+    }
+
     #[tokio::test]
-    async fn loopback_handshake_opens_the_session() {
+    async fn loopback_handshake_delivers_plaintext_and_ignores_rules() {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
         let (tx, rx) = smol_unbounded::<ConnectionEvent>();
@@ -609,14 +827,17 @@ mod tests {
         peer_recv_response(&peer, nonce_a).await;
         peer_send_session_ok(&peer, client_addr).await;
 
-        // Event order: Connected → StatusHint(waiting) → StatusHint(established).
+        // Event order: Connected → ClientWriteSenderReady → StatusHint(waiting) →
+        // StatusHint(established).
         let hint_established = t!("udp_session.hint_established").to_string();
         let hint_waiting = t!("udp_session.hint_waiting").to_string();
+        let mut write_tx = None;
         let mut seen_established = false;
-        for _ in 0..3 {
+        for _ in 0..4 {
             let ev = next_event(&rx).await;
             match ev {
                 ConnectionEvent::Connected(_, _) => {}
+                ConnectionEvent::ClientWriteSenderReady(_, s) => write_tx = Some(s),
                 ConnectionEvent::StatusHint(_, text) => {
                     if text == hint_established {
                         assert!(
@@ -640,6 +861,177 @@ mod tests {
         assert!(
             seen_established,
             "a status hint is expected after the session is established"
+        );
+        let write_tx = write_tx.expect("there should be a write channel");
+
+        // 3) The user sends "ping" → the peer receives a DATA, the decrypted plain text is "ping".
+        write_tx
+            .send(WireMessage::inherit(b"ping".to_vec()))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = decode(&buf[..n]).unwrap();
+        assert_eq!(frame.header.packet_type, PacketType::Data);
+        assert_eq!(frame.header.session_id, SESSION_ID);
+        let Body::Encrypted { nonce, ciphertext } = frame.body else {
+            panic!("expected an encrypted body")
+        };
+        let plain = aes_gcm_decrypt(
+            &session_key(nonce_a),
+            &nonce,
+            &header_bytes(&frame.header),
+            &ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain, b"ping");
+
+        // The rules must not be called: there is no second datagram.
+        let mut buf2 = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), peer.recv_from(&mut buf2))
+                .await
+                .is_err(),
+            "the reply rules must not be called"
+        );
+
+        // 4) The peer sends DATA seq=1 → the client gets one MessagesReceived, the plain text
+        // is JSON.
+        peer_send_data(&peer, client_addr, nonce_a, 1, b"{\"a\":1}").await;
+        let (ev, others) =
+            wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
+            "the handshake packets must not enter the message list"
+        );
+        match ev {
+            ConnectionEvent::MessagesReceived(_, batch) => {
+                assert_eq!(batch.count, 1);
+                assert_eq!(batch.bytes, 7);
+                assert_eq!(batch.messages.len(), 1);
+                assert_eq!(&*batch.messages[0].raw_data, b"{\"a\":1}");
+                assert_eq!(
+                    batch.messages[0].source.as_deref(),
+                    Some(peer_addr.to_string().as_str())
+                );
+            }
+            other => panic!("expected MessagesReceived, got {other:?}"),
+        }
+
+        // 5) The peer sends Close → Disconnected, no Error.
+        peer_send_encrypted(
+            &peer,
+            client_addr,
+            nonce_a,
+            PacketType::Close,
+            2,
+            br#"{"reason":"timeout"}"#,
+        )
+        .await;
+        let (ev, others) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Disconnected(..))).await;
+        assert!(matches!(ev, ConnectionEvent::Disconnected(..)));
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::Error(..))),
+            "Close must not produce an Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_incoming_close_shows_the_reason() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+        let (nonce_a, client_addr, _write_tx) = establish(&peer, &rx).await;
+
+        peer_send_encrypted(
+            &peer,
+            client_addr,
+            nonce_a,
+            PacketType::Close,
+            1,
+            br#"{"reason":"timeout"}"#,
+        )
+        .await;
+
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Disconnected(..))).await;
+        assert!(matches!(ev, ConnectionEvent::Disconnected(..)));
+        let hint = t!("udp_session.close_timeout").to_string();
+        let (ev, _) = wait_for(
+            &rx,
+            |e| matches!(e, ConnectionEvent::StatusHint(_, text) if *text == hint),
+        )
+        .await;
+        assert!(matches!(ev, ConnectionEvent::StatusHint(..)));
+    }
+
+    #[tokio::test]
+    async fn loopback_send_during_handshake_is_not_plaintext() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+
+        // Take the write channel (the handshake is not over yet).
+        let write_tx = loop {
+            if let ConnectionEvent::ClientWriteSenderReady(_, s) = next_event(&rx).await {
+                break s;
+            }
+        };
+        write_tx
+            .send(WireMessage::inherit(b"open text".to_vec()))
+            .await
+            .unwrap();
+
+        // The events carry a Warning(not established), and no plain text.
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Warning(..))).await;
+        match ev {
+            ConnectionEvent::Warning(_, text) => {
+                assert_eq!(text, t!("udp_session.warn_not_established").to_string());
+                assert!(
+                    !text.contains("open text"),
+                    "the plain text must not appear in the warning"
+                );
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+
+        // The peer side only sees a HELLO.
+        let mut buf = [0u8; 2048];
+        let (_n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf[1], 0x01, "only HELLO (type=0x01) should be seen");
+
+        // Within 200 ms there is no second datagram: the plain text did not go on the wire.
+        let mut buf2 = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut buf2))
+                .await
+                .is_err(),
+            "the plain text must not go on the wire before the handshake is over"
         );
     }
 
@@ -701,6 +1093,97 @@ mod tests {
         )
         .await;
         assert!(matches!(ev, ConnectionEvent::StatusHint(..)));
+    }
+
+    #[tokio::test]
+    async fn loopback_trailer_is_not_appended() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut config = client_config(peer_addr.port());
+        config.send_trailer = TrailerKind::CrLf;
+        let mut client = UdpSessionClient::new(
+            config,
+            Some(tx),
+            None,
+            TrailerSetting::new(TrailerKind::CrLf),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+
+        let (nonce_a, _client_addr, write_tx) = establish(&peer, &rx).await;
+        write_tx
+            .send(WireMessage::inherit(b"hi".to_vec()))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = decode(&buf[..n]).unwrap();
+        assert_eq!(frame.header.packet_type, PacketType::Data);
+        let Body::Encrypted { nonce, ciphertext } = frame.body else {
+            panic!("expected an encrypted body")
+        };
+        let plain = aes_gcm_decrypt(
+            &session_key(nonce_a),
+            &nonce,
+            &header_bytes(&frame.header),
+            &ciphertext,
+        )
+        .unwrap();
+        assert_eq!(
+            plain, b"hi",
+            "the DATA payload must not be appended with a trailer"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_oversize_warns_and_session_stays() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+
+        let (nonce_a, client_addr, _write_tx) = establish(&peer, &rx).await;
+
+        // A datagram longer than 1400 bytes: a warning, it does not reach the state machine.
+        peer.send_to(&vec![0u8; MAX_DATAGRAM + 1], client_addr)
+            .await
+            .unwrap();
+        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Warning(..))).await;
+        match ev {
+            ConnectionEvent::Warning(_, text) => {
+                assert_eq!(text, t!("udp_session.warn_too_long").to_string());
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+
+        // The session is still alive: the next DATA is delivered as usual.
+        peer_send_data(&peer, client_addr, nonce_a, 1, b"ok").await;
+        let (ev, others) =
+            wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::Error(..)))
+        );
+        match ev {
+            ConnectionEvent::MessagesReceived(_, batch) => {
+                assert_eq!(batch.messages.len(), 1);
+                assert_eq!(&*batch.messages[0].raw_data, b"ok");
+            }
+            other => panic!("expected MessagesReceived, got {other:?}"),
+        }
     }
 
     #[tokio::test]
