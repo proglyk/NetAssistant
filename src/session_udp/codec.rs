@@ -1,91 +1,91 @@
-//! UDP Session 数据报编解码。
+//! UDP Session datagram codec.
 //!
-//! 字节契约见设计文档附录 A：所有整数为 big-endian，公共头为
-//! `magic u16 = 0xDA75` / `version u8 = 1` / `type u8`。
+//! The byte contract is in appendix A of the design document: all integers are big-endian, the common header is
+//! `magic u16 = 0xDA75` / `version u8 = 1` / `type u8`.
 //!
-//! 帧边界就是一次数据报：帧里没有总长字段，尾随字节一律视为坏帧（不裁剪）。
+//! The frame boundary is one datagram: the frame has no total-length field, trailing bytes always make the frame bad (they are never trimmed).
 
 use crate::session_udp::crypto::{NONCE_LEN, TAG_LEN};
 use std::fmt;
 
-/// 帧头魔数
+/// Frame magic.
 pub const MAGIC: u16 = 0xDA75;
-/// 协议版本
+/// Protocol version.
 pub const VERSION: u8 = 1;
-/// 单个数据报上限（字节）。更长的数据报在进入状态机之前就被丢弃。
+/// Largest datagram (in bytes). A longer datagram is dropped before it reaches the state machine.
 pub const MAX_DATAGRAM: usize = 2048;
-/// HKDF 的 info 串（密钥派生上下文分隔符）
+/// The HKDF info string (the context separator of the key derivation).
 pub const HKDF_INFO: &[u8] = b"netassistant-udp-session-v1";
 
-/// 包类型：Hello
+/// Packet type: Hello
 const TYPE_HELLO: u8 = 1;
-/// 包类型：SessionOk
+/// Packet type: SessionOk
 const TYPE_SESSION_OK: u8 = 2;
-/// 包类型：SessionErr
+/// Packet type: SessionErr
 const TYPE_SESSION_ERR: u8 = 3;
-/// 包类型：Data
+/// Packet type: Data
 const TYPE_DATA: u8 = 4;
-/// 包类型：Close
+/// Packet type: Close
 const TYPE_CLOSE: u8 = 5;
 
-/// 公共头长度（magic 2 + version 1 + type 1）
+/// Length of the common header (magic 2 + version 1 + type 1)
 const HEADER_LEN: usize = 4;
-/// 会话 id / nonce 长度
+/// Length of the session id / nonce
 const ID_LEN: usize = 16;
-/// proof 长度（HMAC-SHA256）
+/// Length of a proof (HMAC-SHA256)
 const PROOF_LEN: usize = 32;
-/// SessionErr 消息长度上限
+/// Largest SessionErr message
 const MAX_SESSION_ERR_MSG: usize = 256;
 
-/// 协议包
+/// Protocol packet
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
-    /// 客户端握手首包：`nonce_a` + `proof_a`
+    /// First packet of the client handshake: `nonce_a` + `proof_a`
     Hello {
         nonce_a: [u8; ID_LEN],
         proof_a: [u8; PROOF_LEN],
     },
-    /// 服务端握手应答：`session_id` + `nonce_b` + `proof_b`
+    /// Handshake answer of the server: `session_id` + `nonce_b` + `proof_b`
     SessionOk {
         session_id: [u8; ID_LEN],
         nonce_b: [u8; ID_LEN],
         proof_b: [u8; PROOF_LEN],
     },
-    /// 服务端拒绝握手
+    /// The server refuses the handshake
     SessionErr { code: u16, message: String },
-    /// 会话数据（密文，含 16 字节 GCM 标签）
+    /// Session data (ciphertext with a 16-byte GCM tag)
     Data {
         session_id: [u8; ID_LEN],
         seq: u64,
         ciphertext: Vec<u8>,
     },
-    /// 会话关闭（不加密、不认证）
+    /// Session close (neither encrypted nor authenticated)
     Close { session_id: [u8; ID_LEN], seq: u64 },
 }
 
-/// 解码失败原因
+/// Reason of a decoding failure
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
-    /// 帧比该类型要求的短
+    /// The frame is shorter than the type requires
     Truncated,
-    /// 魔数不符
+    /// The magic does not match
     BadMagic,
-    /// 版本不符
+    /// The version does not match
     BadVersion,
-    /// 未知包类型
+    /// Unknown packet type
     UnknownType,
-    /// 长度字段与实际长度不符（或超出协议上限）
+    /// The length field does not match the actual length (or exceeds the protocol limit)
     BadLength,
-    /// 帧尾有多余字节
+    /// The frame has trailing bytes
     TrailingBytes,
-    /// 数据报超过 `MAX_DATAGRAM`
+    /// The datagram is longer than `MAX_DATAGRAM`
     TooLong,
-    /// SessionErr 的消息不是合法 UTF-8
+    /// The message of the SessionErr is not valid UTF-8
     BadSessionErrUtf8,
 }
 
 impl fmt::Display for DecodeError {
-    /// 错误文本只描述原因，不回显输入字节（帧里可能含会话数据）
+    /// The error text describes the reason only and does not echo the input bytes (the frame may carry session data)
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             DecodeError::Truncated => "truncated datagram",
@@ -101,7 +101,7 @@ impl fmt::Display for DecodeError {
     }
 }
 
-/// 公共头
+/// Common header
 fn header(packet_type: u8) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0..2].copy_from_slice(&MAGIC.to_be_bytes());
@@ -110,7 +110,7 @@ fn header(packet_type: u8) -> [u8; HEADER_LEN] {
     out
 }
 
-/// 把协议包编码成数据报字节
+/// Encode a protocol packet into datagram bytes
 pub fn encode(packet: &Packet) -> Vec<u8> {
     let mut out = Vec::new();
     match packet {
@@ -156,7 +156,7 @@ pub fn encode(packet: &Packet) -> Vec<u8> {
     out
 }
 
-/// 解析数据报字节
+/// Parse datagram bytes
 pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
     if buf.len() > MAX_DATAGRAM {
         return Err(DecodeError::TooLong);
@@ -240,7 +240,7 @@ pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
                 return Err(DecodeError::BadLength);
             }
             let ciphertext = &body[HEAD_LEN..];
-            // cipher_len 必须等于实际剩余字节数：多出来的尾巴不裁剪，整帧判坏
+            // cipher_len must equal the number of the remaining bytes: the extra tail is not trimmed, the whole frame is bad
             if ciphertext.len() != cipher_len as usize {
                 return Err(DecodeError::BadLength);
             }
@@ -267,7 +267,7 @@ pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
     }
 }
 
-/// Hello 的 HMAC 覆盖范围：magic + version + type + nonce_a（不含 proof）
+/// The HMAC coverage of the Hello: magic + version + type + nonce_a (without the proof)
 pub fn hello_mac_input(nonce_a: &[u8; ID_LEN]) -> [u8; HEADER_LEN + ID_LEN] {
     let mut out = [0u8; HEADER_LEN + ID_LEN];
     out[..HEADER_LEN].copy_from_slice(&header(TYPE_HELLO));
@@ -275,7 +275,7 @@ pub fn hello_mac_input(nonce_a: &[u8; ID_LEN]) -> [u8; HEADER_LEN + ID_LEN] {
     out
 }
 
-/// SessionOk 的 HMAC 覆盖范围：magic + version + type + session_id + nonce_b（不含 proof）
+/// The HMAC coverage of the SessionOk: magic + version + type + session_id + nonce_b (without the proof)
 pub fn session_ok_mac_input(
     session_id: &[u8; ID_LEN],
     nonce_b: &[u8; ID_LEN],
@@ -287,7 +287,7 @@ pub fn session_ok_mac_input(
     out
 }
 
-/// DATA 的 nonce：`session_id[0..4] || seq.to_be_bytes()`
+/// The nonce of the DATA: `session_id[0..4] || seq.to_be_bytes()`
 pub fn data_nonce(session_id: &[u8; ID_LEN], seq: u64) -> [u8; NONCE_LEN] {
     let mut out = [0u8; NONCE_LEN];
     out[..4].copy_from_slice(&session_id[..4]);
@@ -295,7 +295,7 @@ pub fn data_nonce(session_id: &[u8; ID_LEN], seq: u64) -> [u8; NONCE_LEN] {
     out
 }
 
-/// DATA 的 AAD：DATA 帧在密文之前的全部字节（含 cipher_len）
+/// The AAD of the DATA: all bytes of the DATA frame before the ciphertext (including cipher_len)
 pub fn data_aad(
     session_id: &[u8; ID_LEN],
     seq: u64,
@@ -421,7 +421,10 @@ mod tests {
             ciphertext: vec![0u8; 17],
         });
         bytes[28..30].copy_from_slice(&16u16.to_be_bytes());
-        assert!(decode(&bytes).is_err(), "cipher_len меньше хвоста — не Ok");
+        assert!(
+            decode(&bytes).is_err(),
+            "cipher_len is smaller than the tail — not Ok"
+        );
         let mut short_tag = encode(&Packet::Data {
             session_id: [9u8; 16],
             seq: 1,
@@ -438,7 +441,7 @@ mod tests {
             code: 1,
             message: "a".into(),
         });
-        // 附录 A: SessionErr = code u16 + len u16 + 消息，消息首字节在偏移 8
+        // Appendix A: SessionErr = code u16 + len u16 + message, the first byte of the message is at offset 8
         bytes[8] = 0xFF;
         assert!(matches!(
             decode(&bytes),
