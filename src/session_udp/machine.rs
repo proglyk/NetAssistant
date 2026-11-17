@@ -1123,4 +1123,29 @@ mod tests {
             NONCE_LEN
         );
     }
+
+    #[test]
+    fn unknown_close_reason_still_closes_the_session() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // A reason the protocol does not name: the session is closed anyway.
+        let frame = device_frame(PacketType::Close, 1, NOW, br#"{"reason":"boom"}"#);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Closed { reason: Some(r) } if r == "boom"))
+        );
+
+        // A body that is not a reason at all: the session is closed too.
+        let mut m = Machine::new();
+        establish(&mut m);
+        let frame = device_frame(PacketType::Close, 1, NOW, b"not json");
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Closed { reason: Some(r) } if r.is_empty()))
+        );
+    }
 }
