@@ -1,17 +1,21 @@
 //! UDP Session datagram codec.
 //!
-//! Byte contract (protocol §§5.2–5.5, spec
-//! `docs-dev/specs/2026-11-17-udp-session-b-handshake.md`):
+//! Byte contract (protocol §§5.2–5.8, specs
+//! `docs-dev/specs/2026-11-17-udp-session-b-handshake.md` and
+//! `docs-dev/specs/2026-11-17-udp-session-c-data-close.md`):
 //!
 //! - every frame starts with a 12-byte header: version, packet type, session id,
 //!   sequence number, timestamp — all big-endian;
 //! - handshake frames (type < 0x10) carry an unencrypted body whose layout
-//!   depends on the type.
+//!   depends on the type;
+//! - encrypted frames (type >= 0x10) carry nonce, payload length, ciphertext and
+//!   the GCM tag; the AAD is the header, bytes 0..11.
 //!
 //! The frame boundary is one datagram: there is no total-length field, and
 //! trailing bytes are never trimmed — a frame with trailing bytes is a bad
 //! frame.
 
+use crate::session_udp::crypto::{NONCE_LEN, TAG_LEN};
 use std::fmt;
 
 /// Protocol version byte (protocol §5.2).
@@ -27,11 +31,23 @@ pub const MAX_DATAGRAM: usize = 1400;
 pub const HANDSHAKE_NONCE_LEN: usize = 32;
 /// Proof length: HMAC-SHA256 digest.
 pub const PROOF_LEN: usize = 32;
+/// Length of the plaintext-length field of an encrypted frame.
+pub const LENGTH_LEN: usize = 4;
+/// Overhead of an encrypted frame: header, nonce, length field, GCM tag.
+pub const ENCRYPTED_OVERHEAD: usize = HEADER_LEN + NONCE_LEN + LENGTH_LEN + TAG_LEN;
+/// Largest plaintext that still fits into one datagram.
+pub const MAX_PLAINTEXT: usize = MAX_DATAGRAM - ENCRYPTED_OVERHEAD;
 /// HKDF info string of the session key (protocol §5.5).
 ///
 /// 23 ASCII bytes, without the terminating null byte: the firmware keeps the
 /// null byte in its array and passes `SESSION_KEY_INFO.size() - 1` to HKDF.
 pub const HKDF_INFO: &[u8] = b"hiot-udp-v1-session-key";
+/// Replay window of the header timestamp, in seconds (protocol §5.7).
+pub const TIMESTAMP_WINDOW_SECONDS: u32 = 300;
+/// Nonce direction byte: application to device.
+pub const DIRECTION_APP_TO_ESP: u8 = 0x00;
+/// Nonce direction byte: device to application.
+pub const DIRECTION_ESP_TO_APP: u8 = 0x01;
 /// Context byte appended to the nonce pair in the server proof.
 pub const PROOF_B_CONTEXT: u8 = 0x01;
 /// Context byte appended to the nonce pair in the client proof.
@@ -51,6 +67,12 @@ pub enum PacketType {
     SessionOk = 0x04,
     /// Device refuses the handshake: body is the error code.
     SessionErr = 0x05,
+    /// Encrypted command or answer.
+    Data = 0x10,
+    /// Encrypted status snapshot or event, device to application.
+    Push = 0x11,
+    /// Encrypted session close.
+    Close = 0x1F,
 }
 
 impl PacketType {
@@ -62,8 +84,19 @@ impl PacketType {
             0x03 => Some(PacketType::Response),
             0x04 => Some(PacketType::SessionOk),
             0x05 => Some(PacketType::SessionErr),
+            0x10 => Some(PacketType::Data),
+            0x11 => Some(PacketType::Push),
+            0x1F => Some(PacketType::Close),
             _ => None,
         }
+    }
+
+    /// Whether the body of this type is encrypted.
+    pub fn is_encrypted(self) -> bool {
+        matches!(
+            self,
+            PacketType::Data | PacketType::Push | PacketType::Close
+        )
     }
 }
 
@@ -108,6 +141,13 @@ pub enum Body {
         /// 0x04 rate limited, 0x05 version mismatch.
         code: u8,
     },
+    /// Encrypted body of `DATA`, `PUSH` and `CLOSE`.
+    Encrypted {
+        /// Nonce on the wire: session id, direction, seq, 5 random bytes.
+        nonce: [u8; NONCE_LEN],
+        /// Ciphertext with the GCM tag appended.
+        ciphertext: Vec<u8>,
+    },
 }
 
 /// A whole frame: header plus body.
@@ -130,6 +170,8 @@ pub enum DecodeError {
     UnknownType,
     /// The session id is not allowed for this packet type.
     BadSessionId,
+    /// The length field disagrees with the actual frame length.
+    BadLength,
     /// The datagram is longer than `MAX_DATAGRAM`.
     TooLong,
 }
@@ -143,13 +185,14 @@ impl fmt::Display for DecodeError {
             DecodeError::BadVersion => "bad version",
             DecodeError::UnknownType => "unknown packet type",
             DecodeError::BadSessionId => "bad session id",
+            DecodeError::BadLength => "bad length",
             DecodeError::TooLong => "datagram too long",
         };
         write!(f, "{text}")
     }
 }
 
-/// Header bytes of a frame: the 12 bytes of the common header.
+/// Header bytes of a frame: the 12 bytes that are also the GCM AAD.
 pub fn header_bytes(header: &Header) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0] = VERSION;
@@ -173,6 +216,13 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         Body::Response { proof_a } => out.extend_from_slice(proof_a),
         Body::SessionOk => {}
         Body::SessionErr { code } => out.push(*code),
+        Body::Encrypted { nonce, ciphertext } => {
+            out.extend_from_slice(nonce);
+            // The length field counts the open text; the tag is not part of it.
+            let plain_len = ciphertext.len().saturating_sub(TAG_LEN);
+            out.extend_from_slice(&(plain_len as u32).to_be_bytes());
+            out.extend_from_slice(ciphertext);
+        }
     }
     out
 }
@@ -190,9 +240,9 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
     }
     let packet_type = PacketType::from_u8(buf[1]).ok_or(DecodeError::UnknownType)?;
     let session_id = u16::from_be_bytes([buf[2], buf[3]]);
-    // The session id rules mirror the device parser: SESSION_OK must name a
-    // session, the other handshake frames must not.
-    if packet_type == PacketType::SessionOk {
+    // The session id rules mirror the device parser: encrypted frames and
+    // SESSION_OK must name a session, the other handshake frames must not.
+    if packet_type.is_encrypted() || packet_type == PacketType::SessionOk {
         if session_id == 0 {
             return Err(DecodeError::BadSessionId);
         }
@@ -240,8 +290,49 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
             }
             Body::SessionErr { code: body[0] }
         }
+        PacketType::Data | PacketType::Push | PacketType::Close => {
+            if body.len() < NONCE_LEN + LENGTH_LEN + TAG_LEN {
+                return Err(DecodeError::Truncated);
+            }
+            let nonce: [u8; NONCE_LEN] = body[..NONCE_LEN].try_into().unwrap();
+            let plain_len =
+                u32::from_be_bytes(body[NONCE_LEN..NONCE_LEN + LENGTH_LEN].try_into().unwrap());
+            let ciphertext = &body[NONCE_LEN + LENGTH_LEN..];
+            // The length field counts the open text; the ciphertext has the
+            // same length and the tag follows it.
+            if plain_len as usize != ciphertext.len() - TAG_LEN {
+                return Err(DecodeError::BadLength);
+            }
+            Body::Encrypted {
+                nonce,
+                ciphertext: ciphertext.to_vec(),
+            }
+        }
     };
     Ok(Frame { header, body })
+}
+
+/// Build the nonce of an encrypted frame (protocol §5.6).
+///
+/// The first seven bytes are the frame identity: session id, direction and
+/// sequence number. The last five bytes are random, given by the caller — the
+/// state machine has no random source of its own.
+pub fn build_nonce(session_id: u16, direction: u8, seq: u32, tail: [u8; 5]) -> [u8; NONCE_LEN] {
+    let mut out = [0u8; NONCE_LEN];
+    out[..2].copy_from_slice(&session_id.to_be_bytes());
+    out[2] = direction;
+    out[3..7].copy_from_slice(&seq.to_be_bytes());
+    out[7..].copy_from_slice(&tail);
+    out
+}
+
+/// Check the identity prefix of a nonce: session id, direction and seq.
+///
+/// The random tail is not checked — the device does not check it either.
+pub fn nonce_matches(nonce: &[u8; NONCE_LEN], session_id: u16, direction: u8, seq: u32) -> bool {
+    nonce[..2] == session_id.to_be_bytes()
+        && nonce[2] == direction
+        && nonce[3..7] == seq.to_be_bytes()
 }
 
 /// HMAC input of the server proof: `nonce_a ‖ nonce_b ‖ 0x01`.
@@ -274,6 +365,26 @@ pub fn proof_a_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame of the given type with an empty encrypted body.
+    fn encrypted_frame(packet_type: PacketType, session_id: u16, seq: u32) -> Frame {
+        Frame {
+            header: Header {
+                packet_type,
+                session_id,
+                seq,
+                timestamp: 1_700_000_000,
+            },
+            body: Body::Encrypted {
+                nonce: build_nonce(session_id, DIRECTION_APP_TO_ESP, seq, [9u8; 5]),
+                // Ciphertext of 3 bytes plus the tag.
+                ciphertext: [1u8, 2, 3]
+                    .into_iter()
+                    .chain(std::iter::repeat_n(0u8, TAG_LEN))
+                    .collect(),
+            },
+        }
+    }
 
     #[test]
     fn round_trip_handshake_frames() {
@@ -341,19 +452,30 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_encrypted_frames() {
+        for packet_type in [PacketType::Data, PacketType::Push, PacketType::Close] {
+            let frame = encrypted_frame(packet_type, 0x1234, 42);
+            let bytes = encode(&frame);
+            assert_eq!(decode(&bytes).unwrap(), frame);
+            // 12 header + 12 nonce + 4 length + 3 ciphertext + 16 tag
+            assert_eq!(bytes.len(), 47);
+            // The length field counts the open text, not the tag.
+            assert_eq!(&bytes[24..28], &3u32.to_be_bytes());
+        }
+    }
+
+    #[test]
     fn header_fields_are_big_endian() {
-        let header = Header {
-            packet_type: PacketType::SessionOk,
-            session_id: 0x0102,
-            seq: 0x0304_0506,
-            timestamp: 1_700_000_000,
-        };
-        let bytes = header_bytes(&header);
+        let frame = encrypted_frame(PacketType::Data, 0x0102, 0x0304_0506);
+        let bytes = encode(&frame);
         assert_eq!(bytes[0], VERSION);
-        assert_eq!(bytes[1], 0x04);
+        assert_eq!(bytes[1], 0x10);
         assert_eq!(&bytes[2..4], &0x0102u16.to_be_bytes());
         assert_eq!(&bytes[4..8], &0x0304_0506u32.to_be_bytes());
         assert_eq!(&bytes[8..12], &1_700_000_000u32.to_be_bytes());
+        // The header bytes are the AAD: the same 12 bytes come back from the
+        // helper that builds them.
+        assert_eq!(&bytes[..HEADER_LEN], &header_bytes(&frame.header));
     }
 
     #[test]
@@ -401,6 +523,12 @@ mod tests {
             },
             body: Body::SessionOk,
         });
+        assert!(matches!(decode(&bytes), Err(DecodeError::BadSessionId)));
+
+        // The same for encrypted frames.
+        let mut bytes = encode(&encrypted_frame(PacketType::Data, 5, 1));
+        bytes[2] = 0;
+        bytes[3] = 0;
         assert!(matches!(decode(&bytes), Err(DecodeError::BadSessionId)));
     }
 
@@ -464,12 +592,52 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_bad_payload_length() {
+        let mut bytes = encode(&encrypted_frame(PacketType::Data, 1, 1));
+        bytes[24..28].copy_from_slice(&4u32.to_be_bytes());
+        assert!(matches!(decode(&bytes), Err(DecodeError::BadLength)));
+        bytes[24..28].copy_from_slice(&3u32.to_be_bytes());
+        assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
     fn datagram_over_1400_is_too_long() {
         let raw = vec![0u8; MAX_DATAGRAM + 1];
         assert!(matches!(decode(&raw), Err(DecodeError::TooLong)));
         // The limit itself is still a legal datagram.
         let raw = vec![0u8; MAX_DATAGRAM];
         assert!(decode(&raw).is_err());
+        assert_eq!(MAX_PLAINTEXT, 1356);
+    }
+
+    #[test]
+    fn nonce_layout() {
+        let nonce = build_nonce(0x0102, DIRECTION_ESP_TO_APP, 0x0304_0506, [1, 2, 3, 4, 5]);
+        assert_eq!(nonce.len(), NONCE_LEN);
+        assert_eq!(&nonce[..2], &0x0102u16.to_be_bytes());
+        assert_eq!(nonce[2], DIRECTION_ESP_TO_APP);
+        assert_eq!(&nonce[3..7], &0x0304_0506u32.to_be_bytes());
+        assert_eq!(&nonce[7..], &[1, 2, 3, 4, 5]);
+        assert!(nonce_matches(
+            &nonce,
+            0x0102,
+            DIRECTION_ESP_TO_APP,
+            0x0304_0506
+        ));
+        // The direction is part of the identity.
+        assert!(!nonce_matches(
+            &nonce,
+            0x0102,
+            DIRECTION_APP_TO_ESP,
+            0x0304_0506
+        ));
+        assert!(!nonce_matches(
+            &nonce,
+            0x0103,
+            DIRECTION_ESP_TO_APP,
+            0x0304_0506
+        ));
+        assert!(!nonce_matches(&nonce, 0x0102, DIRECTION_ESP_TO_APP, 7));
     }
 
     #[test]
