@@ -441,6 +441,24 @@ pub const MSG_TYPE_ACK: &str = "ack";
 /// Message type of a negative answer (protocol §2.1).
 pub const MSG_TYPE_ERROR: &str = "error";
 
+/// JSON body of an outgoing command.
+///
+/// Seven fields and no others. The caller supplies the identifier, the clock
+/// string, the JSON sequence, and the already trimmed command name. Key order
+/// is not part of the contract.
+pub fn command_envelope(msg_id: &str, ts_utc: &str, seq: u32, cmd: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "protocol_version": "1.0",
+        "msg_type": MSG_TYPE_COMMAND,
+        "msg_id": msg_id,
+        "ts_utc": ts_utc,
+        "seq": seq,
+        "source": "app",
+        "payload": { "cmd": cmd }
+    }))
+    .expect("command envelope is a fixed JSON object")
+}
+
 /// The JSON envelope of a business message (protocol §2.1).
 ///
 /// The envelope is not a separate packet: it is the plain text of a `DATA`
@@ -942,5 +960,24 @@ mod tests {
         assert!(text.contains("payload_length: 2\n"));
         assert!(text.ends_with("payload: hi"));
         assert!(!text.contains("cipher"));
+    }
+
+    #[test]
+    fn command_envelope_has_the_seven_fields() {
+        let bytes = command_envelope("cmd-1", "2023-11-14T22:13:20.000Z", 1, "get_status");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 7);
+        assert_eq!(object["protocol_version"], "1.0");
+        assert_eq!(object["msg_type"], "command");
+        assert_eq!(object["msg_id"], "cmd-1");
+        assert_eq!(object["ts_utc"], "2023-11-14T22:13:20.000Z");
+        assert_eq!(object["seq"], serde_json::json!(1));
+        assert_eq!(object["source"], "app");
+        assert_eq!(object["payload"]["cmd"], "get_status");
+        assert_eq!(object["payload"].as_object().unwrap().len(), 1);
+        assert!(object.get("correlation_id").is_none());
+        assert!(object.get("device_id").is_none());
+        assert!(object.get("signature").is_none());
     }
 }

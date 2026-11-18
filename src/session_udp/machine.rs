@@ -15,12 +15,13 @@
 use crate::session_udp::codec::{
     Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, DecodeError, Envelope, Frame,
     HANDSHAKE_NONCE_LEN, HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR,
-    PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes, nonce_matches,
-    proof_a_input, proof_b_input,
+    PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, command_envelope, decode, header_bytes,
+    nonce_matches, proof_a_input, proof_b_input,
 };
 use crate::session_udp::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
 };
+use chrono::{TimeZone, Utc};
 use std::fmt;
 
 /// Body of the outgoing `CLOSE`: the client only closes on an explicit
@@ -57,6 +58,13 @@ pub enum Command {
         /// Payload; it goes into the body of a `DATA` frame as it is.
         bytes: Vec<u8>,
         /// Five random bytes for the tail of the nonce.
+        nonce_tail: [u8; 5],
+    },
+    /// A command name. The machine builds the envelope.
+    SendCommand {
+        /// The name the user chose. Trimmed here. Empty is not sent.
+        cmd: String,
+        /// Five random bytes for the nonce tail, same as `UserBytes`.
         nonce_tail: [u8; 5],
     },
     /// The user disconnected.
@@ -192,6 +200,10 @@ enum State {
         rx_seq: Option<u32>,
         /// The commands that wait for an answer.
         pending: Vec<PendingCommand>,
+        /// Number of the next command: `cmd-1`, `cmd-2`, ...
+        next_cmd: u32,
+        /// Sequence number of the next command envelope.
+        json_seq: u32,
     },
     Closed,
     Failed,
@@ -221,6 +233,7 @@ impl Machine {
             } => self.on_start(nonce_a, psk, hello_retries, now),
             Command::Tick => self.on_tick(now),
             Command::Packet(frame) => self.on_packet(frame, now),
+            Command::SendCommand { cmd, nonce_tail } => self.on_send_command(cmd, nonce_tail, now),
             Command::UserBytes { bytes, nonce_tail } => self.on_user_bytes(bytes, nonce_tail, now),
             Command::UserDisconnect { nonce_tail } => self.on_user_disconnect(nonce_tail, now),
         }
@@ -435,6 +448,9 @@ impl Machine {
                         rx_seq: None,
                         // No command has been sent yet.
                         pending: Vec::new(),
+                        // Both counters start at one and die with the session.
+                        next_cmd: 1,
+                        json_seq: 1,
                     },
                     vec![
                         Action::Trace(Trace::SessionOpen),
@@ -666,6 +682,41 @@ impl Machine {
         }
     }
 
+    /// The user sends a command name: the machine builds the envelope and
+    /// sends it as the body of a `DATA` frame.
+    ///
+    /// The name is trimmed and an empty one is refused before any datagram:
+    /// the counters of the session grow only for an accepted command.
+    fn on_send_command(&mut self, cmd: String, nonce_tail: [u8; 5], now: u32) -> Vec<Action> {
+        let Some(name) = normalize_sent_name(&cmd) else {
+            return Vec::new();
+        };
+        if !matches!(self.state, State::Established { .. }) {
+            return vec![Action::Warn("not established".to_string())];
+        }
+        let (msg_n, seq) = match &self.state {
+            State::Established {
+                next_cmd, json_seq, ..
+            } => (*next_cmd, *json_seq),
+            _ => return Vec::new(),
+        };
+        let body = command_envelope(&format!("cmd-{msg_n}"), &format_ts_utc(now), seq, &name);
+        let actions = self.on_user_bytes(body, nonce_tail, now);
+        let sent = actions
+            .iter()
+            .any(|action| matches!(action, Action::Send(_, _)));
+        if sent {
+            if let State::Established {
+                next_cmd, json_seq, ..
+            } = &mut self.state
+            {
+                *next_cmd += 1;
+                *json_seq += 1;
+            }
+        }
+        actions
+    }
+
     /// The user sends bytes: they go into the body of a `DATA` frame as they
     /// are, without any parsing.
     fn on_user_bytes(&mut self, bytes: Vec<u8>, nonce_tail: [u8; 5], now: u32) -> Vec<Action> {
@@ -777,13 +828,39 @@ impl fmt::Debug for Machine {
             State::Handshake { tries_left, .. } => {
                 write!(f, "Machine(Handshake, tries_left={tries_left})")
             }
-            State::Established { tx_seq, rx_seq, .. } => write!(
+            State::Established {
+                tx_seq,
+                rx_seq,
+                json_seq,
+                ..
+            } => write!(
                 f,
-                "Machine(Established, tx_seq={tx_seq}, rx_seq={rx_seq:?})"
+                "Machine(Established, tx_seq={tx_seq}, rx_seq={rx_seq:?}, json_seq={json_seq})"
             ),
             State::Closed => write!(f, "Machine(Closed)"),
             State::Failed => write!(f, "Machine(Failed)"),
         }
+    }
+}
+
+/// The clock string of a command envelope.
+///
+/// `now` is unix seconds, so the millisecond field is always zero.
+fn format_ts_utc(now: u32) -> String {
+    Utc.timestamp_opt(i64::from(now), 0)
+        .single()
+        .expect("a u32 unix second is in chrono's range")
+        .format("%Y-%m-%dT%H:%M:%S.000Z")
+        .to_string()
+}
+
+/// The name of a command, trimmed. An empty name is no command.
+fn normalize_sent_name(cmd: &str) -> Option<String> {
+    let name = cmd.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -1524,7 +1601,7 @@ mod tests {
     }
 
     /// The command envelope of the user: the client sends it as it is.
-    fn command_envelope(msg_id: &str, cmd: &str) -> Vec<u8> {
+    fn user_typed_envelope(msg_id: &str, cmd: &str) -> Vec<u8> {
         serde_json::json!({
             "protocol_version": "1.0",
             "msg_type": "command",
@@ -1645,7 +1722,7 @@ mod tests {
         establish(&mut m);
         // The user sends a command envelope: the bytes go to the wire as they
         // are.
-        let command = command_envelope("cmd-1", "get_status");
+        let command = user_typed_envelope("cmd-1", "get_status");
         let actions = m.handle(
             Command::UserBytes {
                 bytes: command.clone(),
@@ -1713,7 +1790,7 @@ mod tests {
     fn an_intermediate_result_keeps_the_command() {
         let mut m = Machine::new();
         establish(&mut m);
-        let command = command_envelope("cmd-2", "start");
+        let command = user_typed_envelope("cmd-2", "start");
         let _ = m.handle(
             Command::UserBytes {
                 bytes: command,
@@ -1764,7 +1841,7 @@ mod tests {
         let mut m = Machine::new();
         establish(&mut m);
         for index in 0..(MAX_PENDING_COMMANDS + 2) {
-            let command = command_envelope(&format!("cmd-{index}"), "get_status");
+            let command = user_typed_envelope(&format!("cmd-{index}"), "get_status");
             let _ = m.handle(
                 Command::UserBytes {
                     bytes: command,
@@ -1803,5 +1880,163 @@ mod tests {
             !actions.iter().any(|a| matches!(a, Action::Reply(_))),
             "the body of a push is not parsed"
         );
+    }
+
+    /// The open text of the single DATA frame of the actions.
+    fn plain_of(actions: &[Action]) -> Vec<u8> {
+        match actions {
+            [Action::Send(_, Some(plain))] => plain.clone(),
+            other => panic!("expected one DATA send, got {other:?}"),
+        }
+    }
+
+    /// The envelope of the single DATA frame of the actions.
+    fn envelope_of(actions: &[Action]) -> serde_json::Value {
+        serde_json::from_slice(&plain_of(actions)).unwrap()
+    }
+
+    #[test]
+    fn send_command_builds_the_envelope_from_now() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(
+            Command::SendCommand {
+                cmd: "  get_status  ".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let value = envelope_of(&actions);
+        assert_eq!(value["msg_id"], "cmd-1");
+        assert_eq!(value["seq"], serde_json::json!(1));
+        assert_eq!(value["ts_utc"], "2023-11-14T22:13:20.000Z");
+        assert_eq!(value["payload"]["cmd"], "get_status");
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        let text = format_frame_fields(sent(&actions), Some(&plain_of(&actions)));
+        assert!(text.contains("payload: "));
+        assert!(text.contains("get_status"));
+    }
+
+    #[test]
+    fn a_second_command_grows_both_counters() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(
+            Command::SendCommand {
+                cmd: "get_status".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        // A raw datagram spends a header sequence number and not a JSON seq.
+        let _ = m.handle(
+            Command::UserBytes {
+                bytes: b"ping".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let actions = m.handle(
+            Command::SendCommand {
+                cmd: "get_capabilities".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let value = envelope_of(&actions);
+        assert_eq!(value["msg_id"], "cmd-2");
+        assert_eq!(value["seq"], serde_json::json!(2));
+        assert_eq!(sent(&actions).header.seq_num, 3);
+    }
+
+    #[test]
+    fn a_blank_command_does_not_send_or_count() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        for blank in ["", "   ", "\n"] {
+            let actions = m.handle(
+                Command::SendCommand {
+                    cmd: blank.into(),
+                    nonce_tail: tail(),
+                },
+                NOW,
+            );
+            assert!(actions.is_empty(), "{blank:?}");
+        }
+        let actions = m.handle(
+            Command::SendCommand {
+                cmd: "get_status".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert_eq!(envelope_of(&actions)["msg_id"], "cmd-1");
+    }
+
+    #[test]
+    fn send_command_before_the_session_sends_nothing() {
+        let mut m = Machine::new();
+        let _ = start(&mut m);
+        let actions = m.handle(
+            Command::SendCommand {
+                cmd: "get_status".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Send(_, _)))
+        );
+    }
+
+    #[test]
+    fn send_command_correlates_the_ack_and_leaves_an_unbound_error() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(
+            Command::SendCommand {
+                cmd: "get_status".into(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        let ack = serde_json::json!({
+            "msg_type": "ack",
+            "correlation_id": "cmd-1",
+            "payload": { "result": "applied" }
+        })
+        .to_string()
+        .into_bytes();
+        let actions = m.handle(
+            Command::Packet(device_frame(PacketType::Data, 1, NOW, &ack)),
+            NOW,
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Ack { .. },
+                command: Some(PendingCommand { msg_id, cmd }),
+            }) if msg_id == "cmd-1" && cmd.as_deref() == Some("get_status")
+        )));
+
+        let err = serde_json::json!({
+            "msg_type": "error",
+            "payload": { "code": "E_INVALID_CMD" }
+        })
+        .to_string()
+        .into_bytes();
+        let actions = m.handle(
+            Command::Packet(device_frame(PacketType::Data, 2, NOW, &err)),
+            NOW,
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Reply(CommandReply {
+                outcome: ReplyOutcome::Error { .. },
+                command: None,
+            })
+        )));
     }
 }
