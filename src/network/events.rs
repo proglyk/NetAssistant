@@ -33,6 +33,9 @@ pub struct WireMessage {
     target: Option<std::net::SocketAddr>,
     /// MQTT 发布元数据（topic/QoS/retain）；TCP/UDP 为 None（规划 D-2）
     mqtt_meta: Option<MqttPublishMeta>,
+    /// true = 这条待发项是 UDP Session 的命令名，不是编辑器字节。
+    /// UDP Session 客户端据此构造信封；其它协议恒为 false。
+    session_command: bool,
 }
 
 /// MQTT 发布元数据，随 `WireMessage` 传递（规划 §5.2）。
@@ -54,6 +57,7 @@ impl WireMessage {
             finalized: false,
             target: None,
             mqtt_meta: None,
+            session_command: false,
         }
     }
 
@@ -64,6 +68,7 @@ impl WireMessage {
             finalized: false,
             target: Some(target),
             mqtt_meta: None,
+            session_command: false,
         }
     }
 
@@ -77,6 +82,7 @@ impl WireMessage {
             finalized: true,
             target: None,
             mqtt_meta: Some(meta),
+            session_command: false,
         }
     }
 
@@ -101,7 +107,24 @@ impl WireMessage {
             finalized: true,
             target,
             mqtt_meta: None,
+            session_command: false,
         }
+    }
+
+    /// A UDP Session command name. The session loop builds the envelope.
+    /// Other protocols never construct this.
+    pub fn session_command(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            finalized: true,
+            target: None,
+            mqtt_meta: None,
+            session_command: true,
+        }
+    }
+
+    pub fn is_session_command(&self) -> bool {
+        self.session_command
     }
 
     /// 最终要写到 socket 上的字节
@@ -304,6 +327,9 @@ pub enum ConnectionEvent {
     /// UI 侧以成功色展示并在数秒后自动消失; 与 `Warning` 区分:
     /// 后者是"操作被拒绝 / 连接异常"等需要红色常驻的问题提示。
     StatusHint(String, String),
+    /// The UDP Session handshake is over: the session is established.
+    /// The UI enables the command form only then.
+    SessionReady(String),
     /// 回复规则集共享状态就绪(UI 运行时下发整表；服务端多客户端共享同一 store)
     ///
     /// 客户端侧不需要此事件：客户端是 1:1，在 `TcpClient::new` / `UdpClient::new`
@@ -355,5 +381,14 @@ mod tests {
         assert!(!msg.bypasses_trailer(), "普通发送仍继承连接 trailer");
         let (_, meta) = msg.into_parts();
         assert!(meta.is_none());
+    }
+
+    /// UDP Session 命令名与普通发送字节的区别：一个标记位。
+    #[test]
+    fn session_command_wire_is_marked_and_inherit_is_not() {
+        let marked = WireMessage::session_command(b"get_status".to_vec());
+        assert!(marked.is_session_command());
+        assert_eq!(marked.data(), b"get_status");
+        assert!(!WireMessage::inherit(b"get_status".to_vec()).is_session_command());
     }
 }

@@ -477,9 +477,9 @@ impl NetworkConnection for UdpSessionClient {
                                         continue;
                                     };
                                     // The user bytes enter the state machine as they are: no trailer is appended, the
-                                                                        // finalized flag is not read.
+                                                                        // finalized flag is not read. A marked wire is a command name.
                                     let actions = machine.handle(
-                                        Command::UserBytes { bytes: wire.data().to_vec(), nonce_tail: tail },
+                                        command_for_wire(wire.is_session_command(), wire.data(), tail),
                                         unix_now(),
                                     );
                                     let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
@@ -531,6 +531,20 @@ enum Flow {
     Established,
     /// Stop the loop.
     Stop,
+}
+
+/// The command of a wire message: a marked wire carries a command name for
+/// the state machine, a plain wire carries the editor bytes.
+fn command_for_wire(session_command: bool, bytes: &[u8], nonce_tail: [u8; 5]) -> Command {
+    if session_command {
+        let cmd = String::from_utf8(bytes.to_vec()).unwrap_or_default();
+        Command::SendCommand { cmd, nonce_tail }
+    } else {
+        Command::UserBytes {
+            bytes: bytes.to_vec(),
+            nonce_tail,
+        }
+    }
 }
 
 /// Translate the actions of the state machine into protocol packets and UI events.
@@ -591,6 +605,10 @@ async fn apply(
             }
             Action::Established { .. } => {
                 if let Some(sender) = event_sender {
+                    // The session is open: the UI may send commands now.
+                    let _ = sender
+                        .send(ConnectionEvent::SessionReady(id.to_string()))
+                        .await;
                     let _ = sender
                         .send(ConnectionEvent::StatusHint(
                             id.to_string(),
@@ -978,6 +996,8 @@ mod tests {
                 ConnectionEvent::Connected(_, _) => {}
                 ConnectionEvent::ClientWriteSenderReady(_, s) => write_tx = Some(s),
                 ConnectionEvent::MessageReceived(_, m) if m.stage.is_some() => {}
+                // The session is open: the UI may send commands now.
+                ConnectionEvent::SessionReady(_) => {}
                 ConnectionEvent::StatusHint(_, text) => {
                     if text == hint_established {
                         assert!(
@@ -1767,5 +1787,22 @@ mod tests {
             close[0].contains("payload: {\"reason\":\"user_disconnect\"}"),
             "the close reason is the payload of the decoder line"
         );
+    }
+
+    /// A marked wire carries a command name; a plain wire carries editor bytes.
+    #[test]
+    fn a_marked_wire_is_a_send_command_and_a_plain_wire_is_user_bytes() {
+        let tail = [1u8, 2, 3, 4, 5];
+        match command_for_wire(true, b"get_status", tail) {
+            Command::SendCommand { cmd, nonce_tail } => {
+                assert_eq!(cmd, "get_status");
+                assert_eq!(nonce_tail, tail);
+            }
+            other => panic!("expected SendCommand, got {other:?}"),
+        }
+        match command_for_wire(false, b"{\"a\":1}", tail) {
+            Command::UserBytes { bytes, .. } => assert_eq!(bytes, b"{\"a\":1}"),
+            other => panic!("expected UserBytes, got {other:?}"),
+        }
     }
 }
