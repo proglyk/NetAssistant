@@ -908,7 +908,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Challenge,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: unix_now(),
             },
             body: Body::Challenge {
@@ -945,7 +945,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionOk,
                 session_id: SESSION_ID,
-                seq: 0,
+                seq_num: 0,
                 timestamp: unix_now(),
             },
             body: Body::SessionOk,
@@ -968,16 +968,16 @@ mod tests {
         client_addr: SocketAddr,
         nonce_a: [u8; HANDSHAKE_NONCE_LEN],
         packet_type: PacketType,
-        seq: u32,
+        seq_num: u32,
         plain: &[u8],
     ) {
         let header = Header {
             packet_type,
             session_id: SESSION_ID,
-            seq,
+            seq_num,
             timestamp: unix_now(),
         };
-        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq, [0xCD; 5]);
+        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq_num, [0xCD; 5]);
         let aad = header_bytes(&header);
         let ciphertext = aes_gcm_encrypt(&session_key(nonce_a), &nonce, &aad, plain).unwrap();
         let frame = Frame {
@@ -992,10 +992,10 @@ mod tests {
         peer: &UdpSocket,
         client_addr: SocketAddr,
         nonce_a: [u8; HANDSHAKE_NONCE_LEN],
-        seq: u32,
+        seq_num: u32,
         plain: &[u8],
     ) {
-        peer_send_encrypted(peer, client_addr, nonce_a, PacketType::Data, seq, plain).await;
+        peer_send_encrypted(peer, client_addr, nonce_a, PacketType::Data, seq_num, plain).await;
     }
 
     /// Establish the session: handshake plus the write channel.
@@ -1290,7 +1290,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Challenge,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: unix_now(),
             },
             body: Body::Challenge {

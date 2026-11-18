@@ -24,7 +24,7 @@ use std::fmt;
 
 /// Protocol version byte (protocol §5.2).
 pub const VERSION: u8 = 0x01;
-/// Header length in bytes: version, type, session id, seq, timestamp.
+/// Header length in bytes: version, type, session id, seq_num, timestamp.
 pub const HEADER_LEN: usize = 12;
 /// Largest datagram accepted by the parser (protocol §5.1, §5.8.1).
 ///
@@ -125,8 +125,8 @@ pub struct Header {
     pub packet_type: PacketType,
     /// Session id: 0 during the handshake, except in `SESSION_OK`.
     pub session_id: u16,
-    /// Sequence number: 0 during the handshake.
-    pub seq: u32,
+    /// Sequence number (`seq_num` in protocol §5.2): 0 during the handshake.
+    pub seq_num: u32,
     /// Unix seconds.
     pub timestamp: u32,
 }
@@ -161,7 +161,7 @@ pub enum Body {
     },
     /// Encrypted body of `DATA`, `PUSH` and `CLOSE`.
     Encrypted {
-        /// Nonce on the wire: session id, direction, seq, 5 random bytes.
+        /// Nonce on the wire: session id, direction, seq_num, 5 random bytes.
         nonce: [u8; NONCE_LEN],
         /// Ciphertext with the GCM tag appended.
         ciphertext: Vec<u8>,
@@ -216,7 +216,7 @@ pub fn header_bytes(header: &Header) -> [u8; HEADER_LEN] {
     out[0] = VERSION;
     out[1] = header.packet_type as u8;
     out[2..4].copy_from_slice(&header.session_id.to_be_bytes());
-    out[4..8].copy_from_slice(&header.seq.to_be_bytes());
+    out[4..8].copy_from_slice(&header.seq_num.to_be_bytes());
     out[8..12].copy_from_slice(&header.timestamp.to_be_bytes());
     out
 }
@@ -270,7 +270,7 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
     let header = Header {
         packet_type,
         session_id,
-        seq: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        seq_num: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
         timestamp: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
     };
     let body = &buf[HEADER_LEN..];
@@ -335,22 +335,27 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
 /// The first seven bytes are the frame identity: session id, direction and
 /// sequence number. The last five bytes are random, given by the caller — the
 /// state machine has no random source of its own.
-pub fn build_nonce(session_id: u16, direction: u8, seq: u32, tail: [u8; 5]) -> [u8; NONCE_LEN] {
+pub fn build_nonce(session_id: u16, direction: u8, seq_num: u32, tail: [u8; 5]) -> [u8; NONCE_LEN] {
     let mut out = [0u8; NONCE_LEN];
     out[..2].copy_from_slice(&session_id.to_be_bytes());
     out[2] = direction;
-    out[3..7].copy_from_slice(&seq.to_be_bytes());
+    out[3..7].copy_from_slice(&seq_num.to_be_bytes());
     out[7..].copy_from_slice(&tail);
     out
 }
 
-/// Check the identity prefix of a nonce: session id, direction and seq.
+/// Check the identity prefix of a nonce: session id, direction and seq_num.
 ///
 /// The random tail is not checked — the device does not check it either.
-pub fn nonce_matches(nonce: &[u8; NONCE_LEN], session_id: u16, direction: u8, seq: u32) -> bool {
+pub fn nonce_matches(
+    nonce: &[u8; NONCE_LEN],
+    session_id: u16,
+    direction: u8,
+    seq_num: u32,
+) -> bool {
     nonce[..2] == session_id.to_be_bytes()
         && nonce[2] == direction
-        && nonce[3..7] == seq.to_be_bytes()
+        && nonce[3..7] == seq_num.to_be_bytes()
 }
 
 /// HMAC input of the server proof: `nonce_a ‖ nonce_b ‖ 0x01`.
@@ -467,16 +472,16 @@ mod tests {
     use super::*;
 
     /// A frame of the given type with an empty encrypted body.
-    fn encrypted_frame(packet_type: PacketType, session_id: u16, seq: u32) -> Frame {
+    fn encrypted_frame(packet_type: PacketType, session_id: u16, seq_num: u32) -> Frame {
         Frame {
             header: Header {
                 packet_type,
                 session_id,
-                seq,
+                seq_num,
                 timestamp: 1_700_000_000,
             },
             body: Body::Encrypted {
-                nonce: build_nonce(session_id, DIRECTION_APP_TO_ESP, seq, [9u8; 5]),
+                nonce: build_nonce(session_id, DIRECTION_APP_TO_ESP, seq_num, [9u8; 5]),
                 // Ciphertext of 3 bytes plus the tag.
                 ciphertext: [1u8, 2, 3]
                     .into_iter()
@@ -492,7 +497,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Hello,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 111,
             },
             body: Body::Hello {
@@ -505,7 +510,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Challenge,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 222,
             },
             body: Body::Challenge {
@@ -519,7 +524,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Response,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 333,
             },
             body: Body::Response {
@@ -532,7 +537,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionOk,
                 session_id: 7,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 444,
             },
             body: Body::SessionOk,
@@ -543,7 +548,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionErr,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 555,
             },
             body: Body::SessionErr { code: 0x02 },
@@ -584,7 +589,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionErr,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::SessionErr { code: 1 },
@@ -603,7 +608,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Hello,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::Hello {
@@ -618,7 +623,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionOk,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::SessionOk,
@@ -639,7 +644,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Hello,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::Hello {
@@ -654,7 +659,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Hello,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::Hello {
@@ -669,7 +674,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionOk,
                 session_id: 3,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::SessionOk,
@@ -682,7 +687,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionErr,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: 0,
             },
             body: Body::SessionErr { code: 1 },

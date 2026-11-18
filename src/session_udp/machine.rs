@@ -303,7 +303,7 @@ impl Machine {
             header: Header {
                 packet_type: PacketType::Hello,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: now,
             },
             body: Body::Hello { nonce_a },
@@ -368,7 +368,7 @@ impl Machine {
                     header: Header {
                         packet_type: PacketType::Response,
                         session_id: 0,
-                        seq: 0,
+                        seq_num: 0,
                         timestamp: now,
                     },
                     body: Body::Response { proof_a },
@@ -454,7 +454,12 @@ impl Machine {
             return vec![Action::Warn("foreign session".to_string())];
         }
         // The nonce names the session, the direction and the sequence number.
-        if !nonce_matches(nonce, session_id, DIRECTION_ESP_TO_APP, frame.header.seq) {
+        if !nonce_matches(
+            nonce,
+            session_id,
+            DIRECTION_ESP_TO_APP,
+            frame.header.seq_num,
+        ) {
             return vec![Action::Warn("bad nonce".to_string())];
         }
         // The replay window of the header timestamp (protocol §5.7).
@@ -468,7 +473,7 @@ impl Machine {
             _ => None,
         };
         if let Some(last) = rx_seq {
-            if frame.header.seq <= last {
+            if frame.header.seq_num <= last {
                 return vec![Action::Warn("bad seq".to_string())];
             }
         }
@@ -480,7 +485,7 @@ impl Machine {
         };
         // The frame is accepted: the receive counter moves.
         if let State::Established { rx_seq, .. } = &mut self.state {
-            *rx_seq = Some(frame.header.seq);
+            *rx_seq = Some(frame.header.seq_num);
         }
         match frame.header.packet_type {
             PacketType::Data => {
@@ -615,7 +620,7 @@ impl Machine {
         packet_type: PacketType,
         key: &[u8; 32],
         session_id: u16,
-        seq: u32,
+        seq_num: u32,
         nonce_tail: [u8; 5],
         now: u32,
         plain: &[u8],
@@ -623,11 +628,11 @@ impl Machine {
         let header = Header {
             packet_type,
             session_id,
-            seq,
+            seq_num,
             timestamp: now,
         };
         // The client is the application side, so its direction byte is 0x00.
-        let nonce = build_nonce(session_id, DIRECTION_APP_TO_ESP, seq, nonce_tail);
+        let nonce = build_nonce(session_id, DIRECTION_APP_TO_ESP, seq_num, nonce_tail);
         let aad = header_bytes(&header);
         // The key and the nonce have fixed lengths, so encryption only fails on
         // a defect of the implementation.
@@ -725,9 +730,9 @@ impl Machine {
 
     /// Test helper: move the send counter (only in an open session).
     #[cfg(test)]
-    fn test_set_tx_seq(&mut self, seq: u32) {
+    fn test_set_tx_seq(&mut self, seq_num: u32) {
         if let State::Established { tx_seq, .. } = &mut self.state {
-            *tx_seq = seq;
+            *tx_seq = seq_num;
         }
     }
 }
@@ -805,7 +810,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::Challenge,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: NOW,
             },
             body: Body::Challenge {
@@ -820,7 +825,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionOk,
                 session_id: SESSION_ID,
-                seq: 0,
+                seq_num: 0,
                 timestamp: NOW,
             },
             body: Body::SessionOk,
@@ -847,14 +852,14 @@ mod tests {
     ///
     /// The header is the AAD, so it has to be fixed before the encryption: a
     /// header changed afterwards would not verify.
-    fn device_frame(packet_type: PacketType, seq: u32, timestamp: u32, plain: &[u8]) -> Frame {
+    fn device_frame(packet_type: PacketType, seq_num: u32, timestamp: u32, plain: &[u8]) -> Frame {
         let header = Header {
             packet_type,
             session_id: SESSION_ID,
-            seq,
+            seq_num,
             timestamp,
         };
-        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq, [0xCD; 5]);
+        let nonce = build_nonce(SESSION_ID, DIRECTION_ESP_TO_APP, seq_num, [0xCD; 5]);
         let aad = header_bytes(&header);
         let ciphertext = aes_gcm_encrypt(&session_key(), &nonce, &aad, plain).unwrap();
         Frame {
@@ -864,8 +869,8 @@ mod tests {
     }
 
     /// A DATA frame of the device.
-    fn device_data(seq: u32, plain: &[u8]) -> Frame {
-        device_frame(PacketType::Data, seq, NOW, plain)
+    fn device_data(seq_num: u32, plain: &[u8]) -> Frame {
+        device_frame(PacketType::Data, seq_num, NOW, plain)
     }
 
     /// The frame the machine sent, or a panic.
@@ -889,7 +894,7 @@ mod tests {
         let frame = sent(&hello);
         assert_eq!(frame.header.packet_type, PacketType::Hello);
         assert_eq!(frame.header.session_id, 0);
-        assert_eq!(frame.header.seq, 0);
+        assert_eq!(frame.header.seq_num, 0);
         assert_eq!(frame.header.timestamp, NOW);
         let Body::Hello {
             nonce_a: sent_nonce,
@@ -927,7 +932,7 @@ mod tests {
             header: Header {
                 packet_type: PacketType::SessionErr,
                 session_id: 0,
-                seq: 0,
+                seq_num: 0,
                 timestamp: NOW,
             },
             body: Body::SessionErr { code: 2 },
@@ -1047,7 +1052,7 @@ mod tests {
         let frame = sent(&actions);
         assert_eq!(frame.header.packet_type, PacketType::Data);
         assert_eq!(frame.header.session_id, SESSION_ID);
-        assert_eq!(frame.header.seq, 1);
+        assert_eq!(frame.header.seq_num, 1);
         let Body::Encrypted { nonce, ciphertext } = &frame.body else {
             panic!("expected an encrypted body");
         };
@@ -1093,7 +1098,7 @@ mod tests {
             },
             NOW,
         );
-        assert_eq!(sent(&actions).header.seq, 1);
+        assert_eq!(sent(&actions).header.seq_num, 1);
     }
 
     #[test]
@@ -1147,7 +1152,7 @@ mod tests {
         let actions = m.handle(Command::Packet(frame), NOW);
         assert!(matches!(&actions[..], [Action::Warn(text)] if text == "foreign session"));
 
-        // The nonce must name the session, the direction and the seq.
+        // The nonce must name the session, the direction and the seq_num.
         let mut frame = device_data(1, b"hello");
         let Body::Encrypted { nonce, .. } = &mut frame.body else {
             unreachable!()
@@ -1298,7 +1303,7 @@ mod tests {
             },
             NOW,
         );
-        assert_eq!(sent(&actions).header.seq, 1);
+        assert_eq!(sent(&actions).header.seq_num, 1);
     }
 
     #[test]
