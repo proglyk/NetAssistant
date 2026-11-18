@@ -539,6 +539,12 @@ connection_tab:
   mode_hex:
     zh-CN: 十六进制
     en: Hex
+  mode_command:
+    zh-CN: 命令
+    en: Command
+  command_name_label:
+    zh-CN: 命令名
+    en: Command name
   auto_reply:
     zh-CN: 自动回复
     en: Auto Reply

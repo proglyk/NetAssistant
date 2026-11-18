@@ -50,6 +50,9 @@ new_connection:
   mode_hex:
     zh-CN: 十六进制
     en: Hexadecimal
+  mode_command:
+    zh-CN: 命令
+    en: Command
   decoder_label:
     zh-CN: 解码器
     en: Decoder
