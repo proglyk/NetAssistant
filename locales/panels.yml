@@ -1072,8 +1072,8 @@ udp_session:
     zh-CN: 发送 %{packet}
     en: send %{packet}
   trace_encrypt:
-    zh-CN: 加密，cipher = %{cipher}
-    en: "encrypt, cipher = %{cipher}"
+    zh-CN: 加密，%{cipher}
+    en: "encrypt, %{cipher}"
   trace_success:
     zh-CN: 成功
     en: success
