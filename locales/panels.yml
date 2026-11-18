@@ -928,3 +928,170 @@ mqtt_history:
   clear:
     zh-CN: 清空历史
     en: Clear History
+
+udp_session:
+  err_empty_psk:
+    zh-CN: 预共享密钥为空
+    en: Pre-shared key is empty
+  err_handshake_timeout:
+    zh-CN: 握手超时
+    en: Handshake timed out
+  err_bad_proof:
+    zh-CN: 会话证实失败
+    en: Session proof rejected
+  err_bad_session_err:
+    zh-CN: 会话错误报文损坏
+    en: Session error packet is corrupt
+  err_session:
+    zh-CN: 会话错误 %{detail}
+    en: Session error %{detail}
+  err_auth_failed:
+    zh-CN: 认证失败，共享密钥不正确
+    en: "Authentication failed: wrong shared secret"
+  err_max_sessions:
+    zh-CN: 设备的所有会话都被占用
+    en: All device sessions are busy
+  err_not_bound:
+    zh-CN: 设备未配网
+    en: Device is not bound
+  err_rate_limited:
+    zh-CN: 尝试过于频繁，请稍后再试
+    en: Too many attempts; try again later
+  err_version_mismatch:
+    zh-CN: 协议版本不匹配
+    en: Protocol version mismatch
+  err_seq_exhausted:
+    zh-CN: 发送序号已用尽
+    en: Send sequence exhausted
+  err_no_server:
+    zh-CN: UDP Session 没有服务端角色
+    en: UDP Session has no server role
+  warn_not_established:
+    zh-CN: 会话尚未建立，未发送
+    en: Session is not up; nothing sent
+  warn_foreign_session:
+    zh-CN: 收到其他会话的报文
+    en: Packet from another session
+  warn_bad_nonce:
+    zh-CN: 随机数与报文头不符，报文已丢弃
+    en: Nonce does not match the header; packet dropped
+  warn_timestamp_out_of_window:
+    zh-CN: 时间戳超出 300 秒窗口，报文已丢弃
+    en: Timestamp outside the 300 s window; packet dropped
+  warn_bad_tag:
+    zh-CN: 解密失败，报文已丢弃
+    en: Decrypt failed; packet dropped
+  warn_bad_seq:
+    zh-CN: 序号不匹配，报文已丢弃
+    en: Sequence mismatch; packet dropped
+  warn_payload_too_large:
+    zh-CN: 消息过长，未发送
+    en: Message too long; not sent
+  warn_random_failed:
+    zh-CN: 无法生成随机数，消息未发送
+    en: Cannot generate random bytes; message not sent
+  warn_unexpected_packet:
+    zh-CN: 收到意外的会话报文
+    en: Unexpected session packet
+  warn_bad_datagram:
+    zh-CN: 报文无法解析，已丢弃
+    en: Datagram rejected
+  warn_too_long:
+    zh-CN: 报文超过 1400 字节，已丢弃
+    en: Datagram longer than 1400 bytes dropped
+  close_user_disconnect:
+    zh-CN: 设备结束了会话：用户断开
+    en: "Device closed the session: user disconnected"
+  close_timeout:
+    zh-CN: 设备结束了会话：超时
+    en: "Device closed the session: timeout"
+  close_secret_rotated:
+    zh-CN: 设备结束了会话：密钥已轮换
+    en: "Device closed the session: secret rotated"
+  close_error:
+    zh-CN: 设备结束了会话：错误
+    en: "Device closed the session: error"
+  close_unknown:
+    zh-CN: 设备结束了会话：%{reason}
+    en: "Device closed the session: %{reason}"
+  close_unknown_reason:
+    zh-CN: 设备结束了会话：原因未知
+    en: "Device closed the session: unknown reason"
+  trace_datagram:
+    zh-CN: 收到数据报
+    en: got datagram
+  trace_decoded:
+    zh-CN: 已解码 %{packet}，%{body}
+    en: decoded %{packet}, %{body}
+  trace_body_hello:
+    zh-CN: 报文头 + nonce_a
+    en: header + nonce_a
+  trace_body_challenge:
+    zh-CN: 报文头 + nonce_b + proof_b
+    en: header + nonce_b + proof_b
+  trace_body_response:
+    zh-CN: 报文头 + proof_a
+    en: header + proof_a
+  trace_body_session_ok:
+    zh-CN: 报文头
+    en: header
+  trace_body_session_err:
+    zh-CN: 报文头 + 错误码
+    en: header + code
+  trace_body_encrypted:
+    zh-CN: 报文头 + nonce + 载荷
+    en: header + nonce + payload
+  trace_cipher_null:
+    zh-CN: cipher = NULL
+    en: cipher = NULL
+  trace_cipher_gcm:
+    zh-CN: cipher = AES-256-GCM
+    en: cipher = AES-256-GCM
+  trace_decrypted:
+    zh-CN: 解密成功
+    en: decryption success
+  trace_proof_b:
+    zh-CN: proof_b = HMAC(secret, nonce_a || nonce_b || 0x01)
+    en: proof_b = HMAC(secret, nonce_a || nonce_b || 0x01)
+  trace_proof_b_ok:
+    zh-CN: proof_b 校验通过
+    en: proof_b matches
+  trace_proof_b_bad:
+    zh-CN: proof_b 校验失败
+    en: proof_b mismatch
+  trace_proof_a:
+    zh-CN: proof_a = HMAC(secret, nonce_b || nonce_a || 0x02)
+    en: proof_a = HMAC(secret, nonce_b || nonce_a || 0x02)
+  trace_session_key:
+    zh-CN: session_key = HKDF(secret, nonce_a || nonce_b)
+    en: session_key = HKDF(secret, nonce_a || nonce_b)
+  trace_open_session:
+    zh-CN: 会话已建立
+    en: open session
+  trace_send:
+    zh-CN: 发送 %{packet}
+    en: send %{packet}
+  trace_encrypt:
+    zh-CN: 加密，%{cipher}
+    en: "encrypt, %{cipher}"
+  trace_success:
+    zh-CN: 成功
+    en: success
+  reply_ack:
+    zh-CN: 设备回应：%{result}
+    en: "Device reply: %{result}"
+  reply_ack_command:
+    zh-CN: 设备回应命令 %{command}：%{result}
+    en: "Device reply to %{command}: %{result}"
+  reply_error:
+    zh-CN: 设备报错：%{code}
+    en: "Device error: %{code}"
+  reply_error_command:
+    zh-CN: 设备对命令 %{command} 报错：%{code}
+    en: "Device failed %{command}: %{code}"
+  hint_waiting:
+    zh-CN: 正在握手
+    en: Handshake in progress
+  hint_established:
+    zh-CN: 会话已建立
+    en: Session established

@@ -180,6 +180,8 @@ pub async fn run_worker(
         }
         // 压测对 MQTT 隐藏（规划 D-8），此分支不可达
         ConnectionType::Mqtt => {}
+        // 压测对 UDP Session 隐藏（会话语义由协议层承担），此分支不可达
+        ConnectionType::UdpSession => {}
     }
 
     debug!("[worker{}] 退出", worker_id);

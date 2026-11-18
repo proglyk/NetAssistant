@@ -46,6 +46,7 @@ use crate::custom_icons::CustomIconName;
 use crate::log_writer::LogWriter;
 use crate::message::{
     DEFAULT_KEEP_LAST, Message, MessageDirection, MessageDisplayMode, MessageListState,
+    MessageStage,
 };
 use crate::network::events::MqttPublishMeta;
 use crate::send_task::{IntervalHandle, PeriodicSource, SendTaskEntry};
@@ -439,6 +440,7 @@ impl ConnectionTabState {
             ConnectionType::Tcp => "TCP",
             ConnectionType::Udp => "UDP",
             ConnectionType::Mqtt => "MQTT",
+            ConnectionType::UdpSession => "UDP Session",
         }
     }
 
@@ -967,6 +969,11 @@ impl<'a> ConnectionTab<'a> {
         let theme = cx.theme().clone();
         let is_client = self.tab_state.connection_config.is_client();
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
+        let is_udp_session =
+            self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+        // 压测/解码器/trailer 这类"流式工具"对 MQTT 与 UDP Session 都收起：
+        // 两者都是自带分帧的应用层协议，压测与解码器没有意义
+        let hide_stream_tools = is_mqtt || is_udp_session;
         let view_mode = self.tab_state.view_mode;
         let tab_id = self.tab_id.clone();
 
@@ -977,7 +984,7 @@ impl<'a> ConnectionTab<'a> {
             .min_w_0()
             .min_h_0()
             // 顶部 tab 切换栏(仅客户端且有压测能力时显示; MQTT 隐藏压测 tab, 规划 D-8)
-            .when(is_client && !is_mqtt, |d| {
+            .when(is_client && !hide_stream_tools, |d| {
                 d.child(self.render_view_mode_tabs(&theme, view_mode, tab_id.clone(), cx))
             })
             // 内容区
@@ -2984,6 +2991,17 @@ impl<'a> ConnectionTab<'a> {
                                                                     t!("connection_tab.received_label").to_string()
                                                                 }),
                                                         )
+                                                        // 阶段标签（UDP 会话日志行）：阶段名带自己的颜色
+                                                        .when(message.stage.is_some(), |this_div| {
+                                                            if let Some(stage) = message.stage {
+                                                                this_div.child(stage_tag(
+                                                                    stage,
+                                                                    ElementId::named_usize("stage", ix),
+                                                                ))
+                                                            } else {
+                                                                this_div
+                                                            }
+                                                        })
                                                         .child(
                                                             div()
                                                                 .text_xs()
@@ -3303,6 +3321,10 @@ impl<'a> ConnectionTab<'a> {
 
         let is_client = self.tab_state.connection_config.is_client();
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
+        let is_udp_session =
+            self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+        // 与 MQTT 同理：会话语义下 trailer 与发送任务都收起
+        let hide_stream_tools = is_mqtt || is_udp_session;
         let selected_client = &self.tab_state.selected_client;
 
         div()
@@ -3609,7 +3631,8 @@ impl<'a> ConnectionTab<'a> {
                                     }),
                             )
                             // MQTT 隐藏 trailer 下拉(配置层强制 None, 规划 D-7)与发送任务按钮(D-8)
-                            .when(!is_mqtt, |this| {
+                            // UDP Session 同理：DATA 载荷不可被追加字节污染
+                            .when(!hide_stream_tools, |this| {
                                 this
                             // 「结尾」下拉: 无 / LF / CRLF 三态循环, 改动即时生效并持久化
                             .child({
@@ -3855,6 +3878,33 @@ fn build_message_context_menu(
     }
 
     menu
+}
+
+/// 阶段标签配色（UDP 会话日志行）。
+///
+/// 取自 `docs-dev/pictures/udp-path.png` 的方案：每个处理环节一个颜色，
+/// 让会话帧的走向一眼可辨。
+fn stage_color(stage: MessageStage) -> Rgba {
+    match stage {
+        MessageStage::Socket => gpui_kit::rgb(0x4dd0e1),
+        MessageStage::Decoder => gpui_kit::rgb(0xff5c8a),
+        MessageStage::Session => gpui_kit::rgb(0x4ade80),
+        MessageStage::Handshake => gpui_kit::rgb(0xfacc15),
+        MessageStage::Sender => gpui_kit::rgb(0xa78bfa),
+    }
+}
+
+/// 阶段标签元素（UDP 会话日志行）。
+///
+/// 标签是会话帧在消息窗口里的唯一标识：没有它，读者分不出哪一行属于
+/// 握手、哪一行属于数据。
+fn stage_tag(stage: MessageStage, id: ElementId) -> Stateful<Div> {
+    div()
+        .id(id)
+        .text_xs()
+        .font_medium()
+        .text_color(stage_color(stage))
+        .child(stage.tag())
 }
 
 /// QoS 文本标签（订阅列表 / 芯片共用）。
@@ -4127,5 +4177,55 @@ mod scrollbar_bottom_tests {
         );
 
         handle.end_drag();
+    }
+}
+
+#[cfg(test)]
+mod stage_tag_tests {
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        AppContext as _, Context, ElementId, IntoElement, ParentElement as _, Render, Styled as _,
+        TestAppContext, TestSupportExt as _, Window, div, px,
+    };
+
+    use super::stage_tag;
+    use crate::message::MessageStage;
+
+    struct Host;
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().flex().child(
+                stage_tag(MessageStage::Sender, ElementId::Name("stage-sender".into()))
+                    .test_support(),
+            )
+        }
+    }
+
+    /// 阶段标签必须真实渲染：它是会话帧在消息窗口里的唯一标识。
+    #[gpui_kit::test]
+    fn the_stage_tag_is_rendered(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let host = cx.new(|_| Host);
+            Root::new(host, window, cx)
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                _ = window.draw(cx);
+            });
+        }
+
+        cx.update(|window, _cx| {
+            let snapshot = window
+                .try_find(ElementId::Name("stage-sender".into()))
+                .expect("阶段标签应已渲染");
+            let bounds = snapshot.bounds();
+            assert!(
+                snapshot.visible() && bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                "阶段标签应可见且非空，实际 bounds={bounds:?}"
+            );
+        });
     }
 }

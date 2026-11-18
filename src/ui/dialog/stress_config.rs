@@ -400,6 +400,8 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, window: &Window, cx
                                 ConnectionType::Udp => "UDP",
                                 // 压测对 MQTT 隐藏（规划 D-8），此分支不可达
                                 ConnectionType::Mqtt => "MQTT",
+                                // 压测对 UDP Session 隐藏，此分支不可达
+                                ConnectionType::UdpSession => "UDP Session",
                             }
                         )),
                 ),

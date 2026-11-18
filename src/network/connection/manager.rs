@@ -7,6 +7,7 @@ use crate::network::protocol::mqtt::{MqttClient, MqttServer};
 use crate::network::protocol::mqtt_v5::MqttV5Client;
 use crate::network::protocol::tcp::{TcpClient, TcpServer};
 use crate::network::protocol::udp::{UdpClient, UdpServer};
+use crate::network::protocol::udp_session::{UdpSessionClient, UdpSessionServer};
 use crate::reply::ReplyRulesStore;
 use smol::channel::Sender;
 use std::collections::HashMap;
@@ -62,6 +63,14 @@ impl NetworkFactory for DefaultNetworkFactory {
                     )),
                 }
             }
+            // UDP Session 客户端：握手在协议层完成，回复规则不参与
+            ConnectionType::UdpSession => Box::new(UdpSessionClient::new(
+                config.clone(),
+                event_sender,
+                net_counters,
+                trailer,
+                reply_rules,
+            )),
         }
     }
 
@@ -86,6 +95,13 @@ impl NetworkFactory for DefaultNetworkFactory {
             )),
             // MQTT 无服务端角色（规划 D-5）：占位返回错误，不会真正启动
             ConnectionType::Mqtt => Box::new(MqttServer::new(
+                config.clone(),
+                event_sender,
+                net_counters,
+                trailer,
+            )),
+            // UDP Session 同样没有服务端角色：占位返回错误
+            ConnectionType::UdpSession => Box::new(UdpSessionServer::new(
                 config.clone(),
                 event_sender,
                 net_counters,

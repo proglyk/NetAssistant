@@ -206,6 +206,24 @@ new_connection:
   error_tls_client_auth_incomplete:
     zh-CN: 客户端证书与私钥必须成对填写
     en: Client certificate and key must be provided together
+  udp_session_psk_label:
+    zh-CN: 预共享密钥
+    en: Pre-shared key
+  udp_session_timeout_label:
+    zh-CN: 握手超时（毫秒）
+    en: Handshake timeout (ms)
+  udp_session_retries_label:
+    zh-CN: HELLO 重试次数
+    en: HELLO retries
+  error_bad_protocol:
+    zh-CN: 未知协议
+    en: Unknown protocol
+  error_bad_udp_session_timeout:
+    zh-CN: 握手超时无效（需为数字，或留空）
+    en: Invalid handshake timeout (a number, or leave empty)
+  error_bad_udp_session_retries:
+    zh-CN: HELLO 重试次数无效（需为 0-255 的数字，或留空）
+    en: Invalid HELLO retries (a number between 0-255, or leave empty)
 
 variable_picker:
   title:

@@ -61,6 +61,8 @@ pub enum ConnectionType {
     Udp,
     /// MQTT 3.1.1 客户端（仅客户端角色，无服务端；见 plans/plan-mqtt-client.md）
     Mqtt,
+    /// UDP Session 客户端（自有 HELLO/SESSION_OK 握手，仅客户端角色）
+    UdpSession,
 }
 
 impl fmt::Display for ConnectionType {
@@ -69,7 +71,23 @@ impl fmt::Display for ConnectionType {
             ConnectionType::Tcp => write!(f, "TCP"),
             ConnectionType::Udp => write!(f, "UDP"),
             ConnectionType::Mqtt => write!(f, "MQTT"),
+            ConnectionType::UdpSession => write!(f, "UDP Session"),
         }
+    }
+}
+
+/// 把对话框里的协议字符串翻译成配置里的协议枚举。
+///
+/// 对话框用的是显示字符串（"TCP" / "UDP" / "MQTT" / "UDP Session"），
+/// 配置文件用的是枚举 serde 名（"tcp" / "udp" / "mqtt" / "udpsession"）。
+/// 认不出的字符串返回 `None`，调用方按表单错误处理（不创建连接）。
+pub fn connection_type_from_dialog(label: &str) -> Option<ConnectionType> {
+    match label {
+        "TCP" => Some(ConnectionType::Tcp),
+        "UDP" => Some(ConnectionType::Udp),
+        "MQTT" => Some(ConnectionType::Mqtt),
+        "UDP Session" => Some(ConnectionType::UdpSession),
+        _ => None,
     }
 }
 
@@ -377,6 +395,41 @@ impl Default for MqttSettings {
     }
 }
 
+/// UDP Session 专属设置（`ClientConfig` 内嵌，仅 protocol == UdpSession 时有意义）。
+///
+/// 预共享密钥与 MQTT 密码同域：写在同一个 JSON 里，运行时绝不出现在日志、
+/// 状态提示与错误文本中。数值字段带 `#[serde(default)]`：旧配置里没有这些字段时
+/// 取默认值，而不是反序列化失败。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UdpSessionSettings {
+    /// 预共享密钥（UTF-8 原文，不做 trim；空串视为非法密钥）
+    pub psk: String,
+    /// 握手超时（毫秒）：超时后重发 HELLO
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    /// HELLO 重发次数（首次 HELLO 之外的重试次数）
+    #[serde(default = "default_hello_retries")]
+    pub hello_retries: u8,
+}
+
+fn default_handshake_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_hello_retries() -> u8 {
+    3
+}
+
+impl Default for UdpSessionSettings {
+    fn default() -> Self {
+        Self {
+            psk: String::new(),
+            handshake_timeout_ms: default_handshake_timeout_ms(),
+            hello_retries: default_hello_retries(),
+        }
+    }
+}
+
 /// 客户端连接配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -402,6 +455,9 @@ pub struct ClientConfig {
     /// MQTT 专属设置（仅 protocol == Mqtt 时有意义；旧配置无此字段 → None）
     #[serde(default)]
     pub mqtt: Option<MqttSettings>,
+    /// UDP Session 专属设置（仅 protocol == UdpSession 时有意义；旧配置无此字段 → None）
+    #[serde(default)]
+    pub udp_session: Option<UdpSessionSettings>,
 }
 
 impl Default for ClientConfig {
@@ -417,6 +473,7 @@ impl Default for ClientConfig {
             local_port: None,
             send_trailer: TrailerKind::None,
             mqtt: None,
+            udp_session: None,
         }
     }
 }
@@ -501,8 +558,12 @@ impl ConnectionConfig {
     /// 获取连接级发送结尾追加字符配置
     ///
     /// MQTT 载荷不可污染（规划 D-7）：无论持久化值为何，MQTT 连接一律视为不追加。
+    /// UDP Session 同理：DATA 的明文载荷在加密前不能被追加字节污染。
     pub fn send_trailer(&self) -> TrailerKind {
-        if self.protocol() == ConnectionType::Mqtt {
+        if matches!(
+            self.protocol(),
+            ConnectionType::Mqtt | ConnectionType::UdpSession
+        ) {
             return TrailerKind::None;
         }
         match self {
@@ -550,6 +611,7 @@ impl ConnectionConfig {
             local_port: None,
             send_trailer: TrailerKind::None,
             mqtt: None,
+            udp_session: None,
         })
     }
 
@@ -572,7 +634,45 @@ mod tests {
     use super::{
         ClientConfig, ConnectionConfig, ConnectionType, MqttSettings, MqttVersion, Qos,
         ServerConfig, TlsSettings, TlsVerifyMode, TrailerKind, WillSettings, apply_trailer,
+        connection_type_from_dialog,
     };
+
+    #[test]
+    fn udp_session_json_name_and_old_client_still_loads() {
+        let old = r#"{"id":"1","protocol":"tcp","server_address":"127.0.0.1","server_port":9}"#;
+        let cfg: ClientConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.protocol, ConnectionType::Tcp);
+        assert!(cfg.udp_session.is_none());
+
+        let marked = r#"{"id":"1","protocol":"udpsession","server_address":"127.0.0.1","server_port":9,"udp_session":{"psk":"s"}}"#;
+        let cfg: ClientConfig = serde_json::from_str(marked).unwrap();
+        assert_eq!(cfg.protocol, ConnectionType::UdpSession);
+        let settings = cfg.udp_session.unwrap();
+        assert_eq!(settings.psk, "s");
+        assert_eq!(settings.handshake_timeout_ms, 1000);
+        assert_eq!(settings.hello_retries, 3);
+    }
+
+    #[test]
+    fn udp_session_defaults_and_trailer_forced_off() {
+        let raw = r#"{"id":"1","protocol":"udpsession","server_address":"127.0.0.1","server_port":9,"send_trailer":"crlf","udp_session":{"psk":"s"}}"#;
+        let cfg: ClientConfig = serde_json::from_str(raw).unwrap();
+        let s = cfg.udp_session.clone().unwrap();
+        assert_eq!(s.handshake_timeout_ms, 1000);
+        assert_eq!(s.hello_retries, 3);
+        let wrapped = ConnectionConfig::Client(cfg);
+        assert_eq!(wrapped.send_trailer(), TrailerKind::None);
+        assert_eq!(ConnectionType::UdpSession.to_string(), "UDP Session");
+        assert_eq!(
+            connection_type_from_dialog("UDP Session"),
+            Some(ConnectionType::UdpSession)
+        );
+        assert_eq!(
+            connection_type_from_dialog("UDP"),
+            Some(ConnectionType::Udp)
+        );
+        assert_eq!(connection_type_from_dialog("nope"), None);
+    }
 
     #[test]
     fn mqtt_settings_serde_roundtrip() {
