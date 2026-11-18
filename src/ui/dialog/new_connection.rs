@@ -307,7 +307,17 @@ fn render_form(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
                                                 &t!("new_connection.mode_hex"),
                                                 theme,
                                                 cx,
-                                            )),
+                                            ))
+                                            // Command chip: only a UDP Session has a command name
+                                            .when(is_udp_session, |this| {
+                                                this.child(render_mode_chip(
+                                                    app,
+                                                    "command",
+                                                    &t!("new_connection.mode_command"),
+                                                    theme,
+                                                    cx,
+                                                ))
+                                            }),
                                     ),
                             )
                             // 解码器（MQTT PUBLISH 天然分帧, 隐藏解码器选择; 规划 D-6）
@@ -357,6 +367,10 @@ fn render_protocol_chip(
                     {
                         app.port_input
                             .update(cx, |input, cx| input.set_value("1883", window, cx));
+                    }
+                    // 新建 UDP Session 连接直接落在 Command 芯片上(编辑模式保留已存模式)
+                    if protocol_owned == "UDP Session" {
+                        app.edit_message_input_mode = "command".to_string();
                     }
                     cx.notify();
                 });
