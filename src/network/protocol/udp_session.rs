@@ -4,8 +4,9 @@
 //! Differences from the plain UDP client:
 //! - the handshake runs in the protocol layer; user bytes never reach the wire
 //!   before it is over (clear text must not leak);
-//! - session data travels in DATA frames (ciphertext plus a 16-byte GCM tag),
-//!   and only the decrypted plain text reaches the log;
+//! - session data travels in DATA frames (ciphertext plus a 16-byte GCM tag);
+//!   the log gets one staged line per stage a frame passed, and the open
+//!   text is the `payload` field of the decoder line;
 //! - reply rules stay out: rules on plain text would bypass GCM authentication.
 //!
 //! The byte contract lives in `src/session_udp/codec.rs` and in
@@ -14,10 +15,12 @@
 
 use crate::config::connection::{ClientConfig, ServerConfig, TrailerSetting};
 use crate::message::{Message, MessageDirection, MessageStage, MessageType};
-use crate::network::events::{ConnectionEvent, NetCounters, ReceivedBatch, WireMessage};
+use crate::network::events::{ConnectionEvent, NetCounters, WireMessage};
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
-use crate::session_udp::codec::{Frame, HANDSHAKE_NONCE_LEN, MAX_DATAGRAM, PacketType, encode};
+use crate::session_udp::codec::{
+    Frame, HANDSHAKE_NONCE_LEN, PacketType, encode, format_frame_fields,
+};
 use crate::session_udp::machine::{
     Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome, Trace,
 };
@@ -105,6 +108,7 @@ fn warn_text(token: &str) -> String {
         "payload too large" => t!("udp_session.warn_payload_too_large").to_string(),
         "unexpected packet" => t!("udp_session.warn_unexpected_packet").to_string(),
         "bad datagram" => t!("udp_session.warn_bad_datagram").to_string(),
+        "too long" => t!("udp_session.warn_too_long").to_string(),
         other => other.to_string(),
     }
 }
@@ -112,87 +116,47 @@ fn warn_text(token: &str) -> String {
 /// Translate a protocol event into the lines of the session window.
 ///
 /// Every line carries a stage (the scheme of `docs-dev/pictures/udp-path.png`);
-/// the text is a short decode of the event, not a raw dump of the frame.
+/// a frame produces exactly one line per stage it passed.
 fn trace_lines(trace: &Trace) -> Vec<(MessageStage, MessageDirection, String)> {
-    match trace {
-        Trace::Datagram => vec![(
+    let line = match trace {
+        Trace::Datagram { len } => (
             MessageStage::Socket,
             MessageDirection::Received,
-            t!("udp_session.trace_datagram").to_string(),
-        )],
-        Trace::Decoded { packet_type } => {
-            let body = match packet_type {
-                PacketType::Hello => t!("udp_session.trace_body_hello"),
-                PacketType::Challenge => t!("udp_session.trace_body_challenge"),
-                PacketType::Response => t!("udp_session.trace_body_response"),
-                PacketType::SessionOk => t!("udp_session.trace_body_session_ok"),
-                PacketType::SessionErr => t!("udp_session.trace_body_session_err"),
-                PacketType::Data | PacketType::Push | PacketType::Close => {
-                    t!("udp_session.trace_body_encrypted")
-                }
-            };
-            let cipher = if packet_type.is_encrypted() {
-                t!("udp_session.trace_cipher_gcm")
-            } else {
-                t!("udp_session.trace_cipher_null")
-            };
-            vec![
-                (
-                    MessageStage::Decoder,
-                    MessageDirection::Received,
-                    t!(
-                        "udp_session.trace_decoded",
-                        packet = packet_type.name(),
-                        body = body.as_ref()
-                    )
-                    .to_string(),
-                ),
-                (
-                    MessageStage::Decoder,
-                    MessageDirection::Received,
-                    cipher.to_string(),
-                ),
-            ]
-        }
-        Trace::Decrypted => vec![(
+            t!("udp_session.trace_datagram", len = *len).to_string(),
+        ),
+        Trace::NotAFrame => (
             MessageStage::Decoder,
             MessageDirection::Received,
-            t!("udp_session.trace_decrypted").to_string(),
-        )],
-        Trace::ProofB { valid } => vec![
-            (
-                MessageStage::Handshake,
-                MessageDirection::Received,
-                t!("udp_session.trace_proof_b").to_string(),
-            ),
-            (
-                MessageStage::Handshake,
-                MessageDirection::Received,
-                if *valid {
-                    t!("udp_session.trace_proof_b_ok").to_string()
-                } else {
-                    t!("udp_session.trace_proof_b_bad").to_string()
-                },
-            ),
-        ],
-        Trace::ProofA => vec![(
+            t!("udp_session.trace_not_a_frame").to_string(),
+        ),
+        Trace::Decoded {
+            frame,
+            plain,
+            tag_failed,
+        } => {
+            let mut text = format_frame_fields(frame, plain.as_deref());
+            if *tag_failed {
+                text.push('\n');
+                text.push_str(&t!("udp_session.trace_tag_failed"));
+            }
+            (MessageStage::Decoder, MessageDirection::Received, text)
+        }
+        Trace::ProofB { valid } => (
             MessageStage::Handshake,
-            MessageDirection::Sent,
-            t!("udp_session.trace_proof_a").to_string(),
-        )],
-        Trace::SessionOpen => vec![
-            (
-                MessageStage::Session,
-                MessageDirection::Received,
-                t!("udp_session.trace_session_key").to_string(),
-            ),
-            (
-                MessageStage::Session,
-                MessageDirection::Received,
-                t!("udp_session.trace_open_session").to_string(),
-            ),
-        ],
-    }
+            MessageDirection::Received,
+            if *valid {
+                t!("udp_session.trace_proof_b_ok").to_string()
+            } else {
+                t!("udp_session.trace_proof_b_bad").to_string()
+            },
+        ),
+        Trace::SessionOpen => (
+            MessageStage::Session,
+            MessageDirection::Received,
+            t!("udp_session.trace_open_session").to_string(),
+        ),
+    };
+    vec![line]
 }
 
 /// The sender stage: what goes out, with which cipher, and with what result.
@@ -212,37 +176,23 @@ async fn send_trace(
         .await;
 }
 
-/// The sender stage lines of a frame that goes out: the frame and its cipher.
+/// The sender stage line of a frame that goes out: the fields of the frame.
 ///
-/// The result of the write follows in the caller: only there is it known.
+/// The open text of an encrypted frame is the `payload` field of the same
+/// line; the ciphertext is never written.
 async fn sender_stage_lines(
     event_sender: &Option<Sender<ConnectionEvent>>,
     id: &str,
     frame: &Frame,
+    plain: Option<&[u8]>,
 ) {
-    let cipher = if frame.header.packet_type.is_encrypted() {
-        t!("udp_session.trace_cipher_gcm")
-    } else {
-        t!("udp_session.trace_cipher_null")
-    };
+    let text = format_frame_fields(frame, plain);
     send_trace(
         event_sender,
         id,
         MessageDirection::Sent,
         MessageStage::Sender,
-        t!(
-            "udp_session.trace_send",
-            packet = frame.header.packet_type.name()
-        )
-        .to_string(),
-    )
-    .await;
-    send_trace(
-        event_sender,
-        id,
-        MessageDirection::Sent,
-        MessageStage::Sender,
-        t!("udp_session.trace_encrypt", cipher = cipher.as_ref()).to_string(),
+        text,
     )
     .await;
 }
@@ -417,22 +367,14 @@ impl NetworkConnection for UdpSessionClient {
             // The first HELLO goes on the wire right away: even a failed handshake has to make the
             // peer see us.
             for action in &actions {
-                if let Action::Send(packet) = action {
+                if let Action::Send(packet, plain) = action {
                     // The sender stage shows the frame before it goes out.
-                    sender_stage_lines(&event_sender, &config.id, packet).await;
+                    sender_stage_lines(&event_sender, &config.id, packet, plain.as_deref()).await;
                     let bytes = encode(packet);
                     socket
                         .send(&bytes)
                         .await
                         .map_err(|e| format!("failed to send HELLO: {}", e))?;
-                    send_trace(
-                        &event_sender,
-                        &config.id,
-                        MessageDirection::Sent,
-                        MessageStage::Sender,
-                        t!("udp_session.trace_success").to_string(),
-                    )
-                    .await;
                     if let Some(c) = &net_counters {
                         c.add_sent(1);
                         c.add_sent_bytes(bytes.len() as u64);
@@ -464,7 +406,6 @@ impl NetworkConnection for UdpSessionClient {
             let cancel = cancel_token.clone();
             let event_sender_loop = event_sender.clone();
             let net_counters_loop = net_counters.clone();
-            let peer = server_addr;
             tokio::spawn(async move {
                 let mut buf = [0u8; RECV_BUFFER_SIZE];
                 // The handshake timer is armed while waiting only: after the session is established
@@ -480,13 +421,13 @@ impl NetworkConnection for UdpSessionClient {
                             // knows the user left
                             let tail = nonce_tail().unwrap_or([0u8; 5]);
                             let actions = machine.handle(Command::UserDisconnect { nonce_tail: tail }, unix_now());
-                            let _ = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
+                            let _ = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
                             break;
                         }
                         _ = &mut sleep, if waiting => {
                             let actions = machine.handle(Command::Tick, unix_now());
                             sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
-                            let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
+                            let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
                             if flow == Flow::Established {
                                 waiting = false;
                             }
@@ -497,19 +438,11 @@ impl NetworkConnection for UdpSessionClient {
                         n = socket.recv(&mut buf) => {
                             match n {
                                 Ok(n) => {
-                                    // An oversized datagram does not reach the state machine: only a warning, the
-                                                                        // session continues.
-                                    if n > MAX_DATAGRAM {
-                                        if let Some(sender) = &event_sender_loop {
-                                            let _ = sender.send(ConnectionEvent::Warning(
-                                                id.clone(),
-                                                t!("udp_session.warn_too_long").to_string(),
-                                            )).await;
-                                        }
-                                        continue;
-                                    }
+                                    // Every datagram reaches the state machine: an
+                                    // oversized one is not a frame, and the journal
+                                    // says so.
                                     let actions = machine.on_datagram(&buf[..n], unix_now());
-                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
+                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
                                     if flow == Flow::Established {
                                         waiting = false;
                                     }
@@ -549,7 +482,7 @@ impl NetworkConnection for UdpSessionClient {
                                         Command::UserBytes { bytes: wire.data().to_vec(), nonce_tail: tail },
                                         unix_now(),
                                     );
-                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &peer, &net_counters_loop).await;
+                                    let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
                                     if flow == Flow::Established {
                                         waiting = false;
                                     }
@@ -606,27 +539,18 @@ async fn apply(
     socket: &UdpSocket,
     event_sender: &Option<Sender<ConnectionEvent>>,
     id: &str,
-    peer: &SocketAddr,
     net_counters: &Option<NetCounters>,
 ) -> Flow {
     let mut flow = Flow::Continue;
     for action in actions {
         match action {
-            Action::Send(frame) => {
-                // The sender stage shows what goes out: the frame, the cipher
-                // and the result of the write.
-                sender_stage_lines(event_sender, id, &frame).await;
+            Action::Send(frame, plain) => {
+                // The sender stage shows what goes out: the fields of the
+                // frame and the open text it carries.
+                sender_stage_lines(event_sender, id, &frame, plain.as_deref()).await;
                 let bytes = encode(&frame);
                 match socket.send(&bytes).await {
                     Ok(_) => {
-                        send_trace(
-                            event_sender,
-                            id,
-                            MessageDirection::Sent,
-                            MessageStage::Sender,
-                            t!("udp_session.trace_success").to_string(),
-                        )
-                        .await;
                         if let Some(c) = net_counters {
                             c.add_sent(1);
                             c.add_sent_bytes(bytes.len() as u64);
@@ -657,23 +581,12 @@ async fn apply(
                 }
             }
             Action::Deliver(plain) => {
-                // The decrypted plain text goes into the message list; handshake packets do not.
-                let mut batch = ReceivedBatch::with_capacity(1);
+                // The decrypted plain text is already the `payload` field of
+                // the decoder line, so only the counters move here.
                 let len = plain.len() as u64;
-                batch.count = 1;
-                batch.bytes = len;
-                batch.messages.push(
-                    Message::new(MessageDirection::Received, plain.clone(), MessageType::Text)
-                        .with_source(peer.to_string()),
-                );
                 if let Some(c) = net_counters {
                     c.add_received(1);
                     c.add_received_bytes(len);
-                }
-                if let Some(sender) = event_sender {
-                    let _ = sender
-                        .send(ConnectionEvent::MessagesReceived(id.to_string(), batch))
-                        .await;
                 }
             }
             Action::Established { .. } => {
@@ -792,8 +705,8 @@ mod tests {
     use crate::config::connection::{ConnectionType, TrailerKind, UdpSessionSettings};
     use crate::reply::model::{ReplyPayload, ReplyRule, ReplyRulesConfig};
     use crate::session_udp::codec::{
-        Body, DIRECTION_ESP_TO_APP, Frame, HKDF_INFO, Header, build_nonce, decode, header_bytes,
-        proof_a_input, proof_b_input,
+        Body, DIRECTION_ESP_TO_APP, Frame, HKDF_INFO, Header, MAX_DATAGRAM, build_nonce, decode,
+        header_bytes, proof_a_input, proof_b_input,
     };
     use crate::session_udp::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256};
     use smol::channel::Receiver;
@@ -1125,29 +1038,29 @@ mod tests {
             "the reply rules must not be called"
         );
 
-        // 4) The peer sends DATA seq=1 → the client gets one MessagesReceived, the plain text
-        // is JSON.
+        // 4) The peer sends DATA seq=1 → the plain text is the payload field
+        // of the decoder line, and no second message carries it.
         peer_send_data(&peer, client_addr, nonce_a, 1, b"{\"a\":1}").await;
-        let (ev, others) =
-            wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        let (ev, others) = wait_for(&rx, |event| {
+            matches!(
+                event,
+                ConnectionEvent::MessageReceived(_, message)
+                    if message.stage == Some(MessageStage::Decoder)
+                        && message.get_content_by_type().contains("payload: {\"a\":1}")
+            )
+        })
+        .await;
         assert!(
             others
                 .iter()
                 .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
-            "the handshake packets must not enter the message list"
+            "the plain text must not enter the message list a second time"
         );
         match ev {
-            ConnectionEvent::MessagesReceived(_, batch) => {
-                assert_eq!(batch.count, 1);
-                assert_eq!(batch.bytes, 7);
-                assert_eq!(batch.messages.len(), 1);
-                assert_eq!(&*batch.messages[0].raw_data, b"{\"a\":1}");
-                assert_eq!(
-                    batch.messages[0].source.as_deref(),
-                    Some(peer_addr.to_string().as_str())
-                );
+            ConnectionEvent::MessageReceived(_, message) => {
+                assert_eq!(message.stage, Some(MessageStage::Decoder));
             }
-            other => panic!("expected MessagesReceived, got {other:?}"),
+            other => panic!("expected a decoder line, got {other:?}"),
         }
 
         // 5) The peer sends Close → Disconnected, no Error.
@@ -1167,6 +1080,12 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e, ConnectionEvent::Error(..))),
             "Close must not produce an Error"
+        );
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
+            "the plain text must not enter the message list a second time"
         );
     }
 
@@ -1383,10 +1302,41 @@ mod tests {
 
         let (nonce_a, client_addr, _write_tx) = establish(&peer, &rx).await;
 
-        // A datagram longer than 1400 bytes: a warning, it does not reach the state machine.
+        // A datagram longer than 1400 bytes: it is not a frame, so the socket
+        // stage sees it and the decoder stage says that it is not a frame.
         peer.send_to(&vec![0u8; MAX_DATAGRAM + 1], client_addr)
             .await
             .unwrap();
+        let (ev, others) = wait_for(&rx, |event| {
+            matches!(
+                event,
+                ConnectionEvent::MessageReceived(_, message)
+                    if message.stage == Some(MessageStage::Decoder)
+            )
+        })
+        .await;
+        assert!(
+            others.iter().any(|event| {
+                matches!(
+                    event,
+                    ConnectionEvent::MessageReceived(_, message)
+                        if message.stage == Some(MessageStage::Socket)
+                )
+            }),
+            "the oversized datagram has a socket line"
+        );
+        let not_a_frame = t!("udp_session.trace_not_a_frame").to_string();
+        match ev {
+            ConnectionEvent::MessageReceived(_, message) => {
+                assert!(
+                    message.get_content_by_type().contains(&not_a_frame),
+                    "the decoder line says that the datagram is not a frame"
+                );
+            }
+            other => panic!("expected a decoder line, got {other:?}"),
+        }
+
+        // The warning names the reason.
         let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::Warning(..))).await;
         match ev {
             ConnectionEvent::Warning(_, text) => {
@@ -1395,21 +1345,33 @@ mod tests {
             other => panic!("expected Warning, got {other:?}"),
         }
 
-        // The session is still alive: the next DATA is delivered as usual.
+        // The session is still alive: the next DATA is decoded as usual.
         peer_send_data(&peer, client_addr, nonce_a, 1, b"ok").await;
-        let (ev, others) =
-            wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        let (ev, others) = wait_for(&rx, |event| {
+            matches!(
+                event,
+                ConnectionEvent::MessageReceived(_, message)
+                    if message.stage == Some(MessageStage::Decoder)
+                        && message.get_content_by_type().contains("payload: ok")
+            )
+        })
+        .await;
         assert!(
             others
                 .iter()
                 .all(|e| !matches!(e, ConnectionEvent::Error(..)))
         );
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
+            "the plain text must not enter the message list a second time"
+        );
         match ev {
-            ConnectionEvent::MessagesReceived(_, batch) => {
-                assert_eq!(batch.messages.len(), 1);
-                assert_eq!(&*batch.messages[0].raw_data, b"ok");
+            ConnectionEvent::MessageReceived(_, message) => {
+                assert_eq!(message.stage, Some(MessageStage::Decoder));
             }
-            other => panic!("expected MessagesReceived, got {other:?}"),
+            other => panic!("expected a decoder line, got {other:?}"),
         }
     }
 
@@ -1483,13 +1445,27 @@ mod tests {
 
         peer_send_data(&peer, client_addr, nonce_a, 1, ERROR).await;
 
-        // The plain text of the answer goes into the message list as it is.
-        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        // The plain text of the answer is the payload field of the decoder line.
+        let (ev, others) = wait_for(&rx, |event| {
+            matches!(
+                event,
+                ConnectionEvent::MessageReceived(_, message)
+                    if message.stage == Some(MessageStage::Decoder)
+                        && message.get_content_by_type().contains("E_INVALID_CMD")
+            )
+        })
+        .await;
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
+            "the plain text must not enter the message list a second time"
+        );
         match ev {
-            ConnectionEvent::MessagesReceived(_, batch) => {
-                assert_eq!(&*batch.messages[0].raw_data, ERROR);
+            ConnectionEvent::MessageReceived(_, message) => {
+                assert_eq!(message.stage, Some(MessageStage::Decoder));
             }
-            other => panic!("expected MessagesReceived, got {other:?}"),
+            other => panic!("expected a decoder line, got {other:?}"),
         }
 
         // The parsed refusal is a warning: the session stays alive.
@@ -1554,12 +1530,26 @@ mod tests {
 
         // The device confirms the command and names it.
         peer_send_data(&peer, client_addr, nonce_a, 1, ACK).await;
-        let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::MessagesReceived(..))).await;
+        let (ev, others) = wait_for(&rx, |event| {
+            matches!(
+                event,
+                ConnectionEvent::MessageReceived(_, message)
+                    if message.stage == Some(MessageStage::Decoder)
+                        && message.get_content_by_type().contains("cmd-1")
+            )
+        })
+        .await;
+        assert!(
+            others
+                .iter()
+                .all(|e| !matches!(e, ConnectionEvent::MessagesReceived(..))),
+            "the plain text must not enter the message list a second time"
+        );
         match ev {
-            ConnectionEvent::MessagesReceived(_, batch) => {
-                assert_eq!(&*batch.messages[0].raw_data, ACK);
+            ConnectionEvent::MessageReceived(_, message) => {
+                assert_eq!(message.stage, Some(MessageStage::Decoder));
             }
-            other => panic!("expected MessagesReceived, got {other:?}"),
+            other => panic!("expected a decoder line, got {other:?}"),
         }
 
         // The confirmation names the command it belongs to.
@@ -1595,6 +1585,40 @@ mod tests {
             .collect()
     }
 
+    /// A frame with a broken tag: the line names the header and the length of
+    /// the payload, and the ciphertext stays out of the log.
+    #[test]
+    fn a_bad_tag_decoder_line_has_the_header_and_no_ciphertext() {
+        let mut ciphertext = b"secret-body".to_vec();
+        ciphertext.extend_from_slice(&[0xab; 16]);
+        let frame = Frame {
+            header: Header {
+                packet_type: PacketType::Data,
+                session_id: 0x5353,
+                seq_num: 4,
+                timestamp: 30,
+            },
+            body: Body::Encrypted {
+                nonce: [0x22; 12],
+                ciphertext,
+            },
+        };
+        let lines = trace_lines(&Trace::Decoded {
+            frame,
+            plain: None,
+            tag_failed: true,
+        });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, MessageStage::Decoder);
+        let text = &lines[0].2;
+        assert!(text.contains("session_id: 0x5353\n"));
+        assert!(text.contains("payload_length: 11\n"));
+        assert!(text.contains(t!("udp_session.trace_tag_failed").as_ref()));
+        assert!(!text.contains("payload:"));
+        assert!(!text.contains("secret-body"));
+        assert!(!text.contains("abababab"));
+    }
+
     #[tokio::test]
     async fn loopback_the_session_frames_are_visible_in_the_log() {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1628,7 +1652,10 @@ mod tests {
         // of a fixed window, so a loaded machine does not fail the test.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut lines: Vec<(MessageStage, String)> = Vec::new();
-        while !lines.iter().any(|(_, text)| text.contains("CLOSE")) {
+        while !lines
+            .iter()
+            .any(|(_, text)| text.contains("packet_type: CLOSE"))
+        {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
@@ -1636,51 +1663,109 @@ mod tests {
             let events = collect_for(&rx, remaining.min(Duration::from_millis(200))).await;
             lines.extend(stage_lines(&events));
         }
-        // The HELLO goes out: the sender stage shows the frame.
+
+        // The outgoing HELLO: one sender line that names the nonce of the client.
+        let hello: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, text)| {
+                *stage == MessageStage::Sender && text.contains("packet_type: HELLO")
+            })
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(hello.len(), 1, "exactly one sender line for the HELLO");
         assert!(
-            lines
-                .iter()
-                .any(|(stage, text)| *stage == MessageStage::Sender && text.contains("HELLO"))
+            hello[0].contains("nonce_a:"),
+            "the sender line names the nonce of the client"
         );
-        // The challenge comes in: the socket stage sees the datagram, the
-        // decoder stage decodes it.
+
+        // The incoming CHALLENGE: one decoder line with the fields of the frame.
+        let challenge: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, text)| {
+                *stage == MessageStage::Decoder && text.contains("packet_type: CHALLENGE")
+            })
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            challenge.len(),
+            1,
+            "exactly one decoder line for the CHALLENGE"
+        );
+        for field in [
+            "session_id:",
+            "seq_num:",
+            "timestamp:",
+            "nonce_b:",
+            "proof_b:",
+        ] {
+            assert!(
+                challenge[0].contains(field),
+                "the decoder line must name {field}"
+            );
+        }
+
+        // The proof check of the device has its own stage: one line.
+        let handshake: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, _)| *stage == MessageStage::Handshake)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            handshake.len(),
+            1,
+            "exactly one handshake line for the challenge of the device"
+        );
+
+        // The old cipher line is gone.
         assert!(
             lines
                 .iter()
-                .any(|(stage, _)| *stage == MessageStage::Socket)
+                .all(|(_, text)| !text.contains("cipher = NULL")),
+            "the log must not carry the old cipher line"
+        );
+
+        // The session stage: the green line is a short text, not a field dump.
+        let session: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, _)| *stage == MessageStage::Session)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(session.len(), 1, "exactly one session line");
+        assert!(
+            !session[0].contains("session_id:"),
+            "the session line is not a field dump"
+        );
+
+        // The SESSION_OK: the decoder line has no nonce of the client.
+        let session_ok: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, text)| {
+                *stage == MessageStage::Decoder && text.contains("packet_type: SESSION_OK")
+            })
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            session_ok.len(),
+            1,
+            "exactly one decoder line for the SESSION_OK"
         );
         assert!(
-            lines
-                .iter()
-                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("CHALLENGE"))
+            !session_ok[0].contains("nonce_a:"),
+            "the SESSION_OK carries no nonce of the client"
         );
-        // The proof check and the session key have their own stages.
+
+        // The CLOSE of the peer: the reason is the payload of the decoder line.
+        let close: Vec<&String> = lines
+            .iter()
+            .filter(|(stage, text)| {
+                *stage == MessageStage::Decoder && text.contains("packet_type: CLOSE")
+            })
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(close.len(), 1, "exactly one decoder line for the CLOSE");
         assert!(
-            lines
-                .iter()
-                .any(|(stage, _)| *stage == MessageStage::Handshake)
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(stage, _)| *stage == MessageStage::Session)
-        );
-        // The RESPONSE goes out.
-        assert!(
-            lines
-                .iter()
-                .any(|(stage, text)| *stage == MessageStage::Sender && text.contains("RESPONSE"))
-        );
-        // The SESSION_OK and the CLOSE of the peer are decoded as well.
-        assert!(
-            lines
-                .iter()
-                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("SESSION_OK"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(stage, text)| *stage == MessageStage::Decoder && text.contains("CLOSE"))
+            close[0].contains("payload: {\"reason\":\"user_disconnect\"}"),
+            "the close reason is the payload of the decoder line"
         );
     }
 }

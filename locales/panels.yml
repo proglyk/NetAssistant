@@ -1018,8 +1018,14 @@ udp_session:
     zh-CN: 设备结束了会话：原因未知
     en: "Device closed the session: unknown reason"
   trace_datagram:
-    zh-CN: 收到数据报
-    en: got datagram
+    zh-CN: 收到数据报，%{len} 字节
+    en: "got datagram, %{len} bytes"
+  trace_not_a_frame:
+    zh-CN: 不是会话帧
+    en: not a session frame
+  trace_tag_failed:
+    zh-CN: 认证标签不符
+    en: tag mismatch
   trace_decoded:
     zh-CN: 已解码 %{packet}，%{body}
     en: decoded %{packet}, %{body}

@@ -13,10 +13,10 @@
 //! command it belongs to.
 
 use crate::session_udp::codec::{
-    Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, Envelope, Frame, HANDSHAKE_NONCE_LEN,
-    HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR, PacketType,
-    TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes, nonce_matches, proof_a_input,
-    proof_b_input,
+    Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, DecodeError, Envelope, Frame,
+    HANDSHAKE_NONCE_LEN, HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR,
+    PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, decode, header_bytes, nonce_matches,
+    proof_a_input, proof_b_input,
 };
 use crate::session_udp::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
@@ -105,27 +105,32 @@ pub struct CommandReply {
 /// Protocol event: the client turns it into a log line with a stage.
 ///
 /// The machine reports facts, not text: the wording belongs to the client,
-/// which knows the UI language. Every event except `ProofA` describes a
-/// received datagram; `ProofA` describes the client proof the machine has
-/// just computed for the outgoing RESPONSE.
+/// which knows the UI language. Every event describes a received datagram or
+/// the frame it carried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trace {
     /// A datagram arrived (socket stage).
-    Datagram,
-    /// The frame was parsed (decoder stage).
-    Decoded {
-        /// Type of the parsed frame.
-        packet_type: PacketType,
+    Datagram {
+        /// Length of the UDP payload.
+        len: usize,
     },
-    /// The frame was decrypted (decoder stage).
-    Decrypted,
+    /// One incoming frame, already parsed (decoder stage).
+    Decoded {
+        /// The parsed frame.
+        frame: Frame,
+        /// The open text, set only after a successful decrypt.
+        plain: Option<Vec<u8>>,
+        /// The GCM tag did not match. The ciphertext stays inside `frame` and
+        /// must not be logged.
+        tag_failed: bool,
+    },
+    /// The bytes are not a frame. No header fields exist.
+    NotAFrame,
     /// The device proof was checked (handshake stage).
     ProofB {
         /// Whether the proof matched the secret.
         valid: bool,
     },
-    /// The client proof was computed (handshake stage).
-    ProofA,
     /// The session key was derived and the session is open (session stage).
     SessionOpen,
 }
@@ -133,8 +138,9 @@ pub enum Trace {
 /// State machine output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// A frame that has to go out.
-    Send(Frame),
+    /// A frame that has to go out. The `Option` is the open text of an
+    /// encrypted frame; handshake frames carry `None`.
+    Send(Frame, Option<Vec<u8>>),
     /// A protocol event to show in the session log.
     Trace(Trace),
     /// Decrypted plaintext.
@@ -223,18 +229,35 @@ impl Machine {
     /// Handle one received datagram: parse it first, and decide by the current
     /// state whether a broken frame is a failure or is dropped silently.
     pub fn on_datagram(&mut self, bytes: &[u8], now: u32) -> Vec<Action> {
-        let mut actions = vec![Action::Trace(Trace::Datagram)];
+        let mut actions = vec![Action::Trace(Trace::Datagram { len: bytes.len() })];
         match decode(bytes) {
             Ok(frame) => {
+                let inner = self.handle(Command::Packet(frame.clone()), now);
+                // The open text is the payload of the decoder line; the tag
+                // failure is a warning of the machine.
+                let plain = inner.iter().find_map(|action| match action {
+                    Action::Deliver(plain) => Some(plain.clone()),
+                    _ => None,
+                });
+                let tag_failed = inner
+                    .iter()
+                    .any(|action| matches!(action, Action::Warn(text) if text == "bad tag"));
                 actions.push(Action::Trace(Trace::Decoded {
-                    packet_type: frame.header.packet_type,
+                    frame,
+                    plain,
+                    tag_failed,
                 }));
-                actions.extend(self.handle(Command::Packet(frame), now));
+                actions.extend(inner);
             }
             // A frame that cannot be parsed is dropped: the device stays silent
             // on garbage too, and answering it would only feed a noise peer.
-            Err(_) => {
-                if matches!(self.state, State::Established { .. }) {
+            Err(err) => {
+                actions.push(Action::Trace(Trace::NotAFrame));
+                if matches!(err, DecodeError::TooLong) {
+                    // An oversized datagram gets its own reason: it is a
+                    // datagram of the device that does not fit a frame.
+                    actions.push(Action::Warn("too long".to_string()));
+                } else if matches!(self.state, State::Established { .. }) {
                     actions.push(Action::Warn("bad datagram".to_string()));
                 }
             }
@@ -265,7 +288,7 @@ impl Machine {
             tries_left: hello_retries,
             nonce_b: None,
         };
-        vec![Action::Send(Self::hello_frame(nonce_a, now))]
+        vec![Action::Send(Self::hello_frame(nonce_a, now), None)]
     }
 
     /// Handshake timeout: resend the same HELLO, and fail when the resends are
@@ -294,7 +317,7 @@ impl Machine {
             // challenge, so the answered challenge is not valid any more.
             *nonce_b = None;
         }
-        vec![Action::Send(Self::hello_frame(nonce_a, now))]
+        vec![Action::Send(Self::hello_frame(nonce_a, now), None)]
     }
 
     /// The HELLO frame of an attempt.
@@ -380,7 +403,7 @@ impl Machine {
                         tries_left,
                         nonce_b: Some(device_nonce),
                     },
-                    vec![trace, Action::Trace(Trace::ProofA), Action::Send(response)],
+                    vec![trace, Action::Send(response, None)],
                 )
             }
             Body::SessionOk => {
@@ -493,8 +516,7 @@ impl Machine {
                 // answer of the device is parsed aside: an "ack" or an
                 // "error" is a reply to a command.
                 let reply = self.take_reply(&plain);
-                let mut actions = vec![Action::Trace(Trace::Decrypted)];
-                actions.push(Action::Deliver(plain));
+                let mut actions = vec![Action::Deliver(plain)];
                 if let Some(reply) = reply {
                     actions.push(Action::Reply(reply));
                 }
@@ -503,7 +525,7 @@ impl Machine {
             PacketType::Push => {
                 // The body of a push is not parsed: the snapshots and the
                 // events are not in the scope of the client yet (spec F).
-                vec![Action::Trace(Trace::Decrypted), Action::Deliver(plain)]
+                vec![Action::Deliver(plain)]
             }
             PacketType::Close => {
                 // The peer closed the session: the reason is read from the
@@ -511,7 +533,7 @@ impl Machine {
                 // session alive.
                 let reason = Some(Self::close_reason(&plain));
                 self.state = State::Closed;
-                vec![Action::Trace(Trace::Decrypted), Action::Closed { reason }]
+                vec![Action::Deliver(plain), Action::Closed { reason }]
             }
             _ => vec![Action::Warn("unexpected packet".to_string())],
         }
@@ -685,7 +707,7 @@ impl Machine {
         if let State::Established { tx_seq, .. } = &mut self.state {
             *tx_seq += 1;
         }
-        vec![Action::Send(frame)]
+        vec![Action::Send(frame, Some(bytes))]
     }
 
     /// The user disconnects: send an encrypted `CLOSE` and end the session.
@@ -711,7 +733,10 @@ impl Machine {
                         now,
                         CLOSE_BODY_USER_DISCONNECT,
                     );
-                    actions.push(Action::Send(frame));
+                    actions.push(Action::Send(
+                        frame,
+                        Some(CLOSE_BODY_USER_DISCONNECT.to_vec()),
+                    ));
                 }
                 self.state = State::Closed;
                 actions.push(Action::Closed { reason: None });
@@ -765,7 +790,7 @@ impl fmt::Debug for Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_udp::codec::{PROOF_LEN, encode};
+    use crate::session_udp::codec::{PROOF_LEN, encode, format_frame_fields};
     use crate::session_udp::crypto::NONCE_LEN;
 
     const PSK: &str = "super-secret-psk";
@@ -835,10 +860,10 @@ mod tests {
     /// Run the handshake to an open session.
     fn establish(m: &mut Machine) {
         let hello = start(m);
-        assert!(matches!(hello[0], Action::Send(_)));
+        assert!(matches!(hello[0], Action::Send(_, _)));
         let challenge = challenge();
         let response = m.handle(Command::Packet(challenge), NOW);
-        assert!(response.iter().any(|a| matches!(a, Action::Send(_))));
+        assert!(response.iter().any(|a| matches!(a, Action::Send(_, _))));
         let ok = m.handle(Command::Packet(session_ok()), NOW);
         assert!(
             ok.iter().any(
@@ -881,7 +906,7 @@ mod tests {
         actions
             .iter()
             .find_map(|action| match action {
-                Action::Send(frame) => Some(frame),
+                Action::Send(frame, _) => Some(frame),
                 _ => None,
             })
             .expect("expected a frame to send")
@@ -997,9 +1022,9 @@ mod tests {
         let mut m = Machine::new();
         let _ = start(&mut m);
 
-        // The challenge: the datagram, the decoded frame, the proof check and
-        // the client proof.
-        let actions = m.on_datagram(&encode(&challenge()), NOW);
+        let frame = challenge();
+        let bytes = encode(&frame);
+        let actions = m.on_datagram(&bytes, NOW);
         let traces: Vec<&Trace> = actions
             .iter()
             .filter_map(|action| match action {
@@ -1010,16 +1035,133 @@ mod tests {
         assert_eq!(
             traces,
             vec![
-                &Trace::Datagram,
+                &Trace::Datagram { len: bytes.len() },
                 &Trace::Decoded {
-                    packet_type: PacketType::Challenge
+                    frame: frame.clone(),
+                    plain: None,
+                    tag_failed: false,
                 },
                 &Trace::ProofB { valid: true },
-                &Trace::ProofA,
             ]
         );
-        // The RESPONSE goes out after the traces of the challenge.
-        assert!(actions.iter().any(|a| matches!(a, Action::Send(_))));
+        assert!(
+            !traces
+                .iter()
+                .any(|trace| matches!(trace, Trace::SessionOpen)),
+            "a challenge does not open the session"
+        );
+        let sent: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Send(sent, plain) => Some((sent, plain)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.header.packet_type, PacketType::Response);
+        assert!(sent[0].1.is_none());
+    }
+
+    #[test]
+    fn a_garbage_datagram_is_one_rejected_trace_and_the_handshake_stays() {
+        let mut m = Machine::new();
+        let _ = start(&mut m);
+        let actions = m.on_datagram(&[0x00, 0x01], NOW);
+        let traces: Vec<&Trace> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Trace(trace) => Some(trace),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(traces, vec![&Trace::Datagram { len: 2 }, &Trace::NotAFrame]);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Failed(_)))
+        );
+        // A later real challenge is still accepted.
+        let again = m.on_datagram(&encode(&challenge()), NOW);
+        assert!(
+            again
+                .iter()
+                .any(|action| matches!(action, Action::Send(_, _)))
+        );
+    }
+
+    #[test]
+    fn a_bad_tag_is_a_decoded_trace_and_the_session_stays() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let mut frame = device_data(1, b"hi");
+        let Body::Encrypted { ciphertext, .. } = &mut frame.body else {
+            unreachable!()
+        };
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xff;
+        let actions = m.on_datagram(&encode(&frame), NOW);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Trace(Trace::Decoded {
+                tag_failed: true,
+                plain: None,
+                ..
+            })
+        )));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Warn(text) if text == "bad tag"))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Closed { .. } | Action::Failed(_)))
+        );
+    }
+
+    #[test]
+    fn outgoing_data_keeps_the_plaintext_beside_the_frame() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(
+            Command::UserBytes {
+                bytes: b"ping".to_vec(),
+                nonce_tail: tail(),
+            },
+            NOW,
+        );
+        match actions.as_slice() {
+            [Action::Send(frame, Some(plain))] => {
+                assert_eq!(frame.header.packet_type, PacketType::Data);
+                assert_eq!(plain, b"ping");
+                let text = format_frame_fields(frame, Some(plain));
+                assert!(text.contains("payload: ping"));
+                assert!(!text.contains("ciphertext"));
+            }
+            other => panic!("expected one DATA send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_err_trace_carries_the_code() {
+        let mut m = Machine::new();
+        let _ = start(&mut m);
+        let frame = Frame {
+            header: Header {
+                packet_type: PacketType::SessionErr,
+                session_id: 0,
+                seq_num: 0,
+                timestamp: NOW,
+            },
+            body: Body::SessionErr { code: 0x02 },
+        };
+        let actions = m.on_datagram(&encode(&frame), NOW);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Trace(Trace::Decoded { frame: got, .. })
+                if matches!(got.body, Body::SessionErr { code: 0x02 })
+        )));
     }
 
     #[test]
@@ -1265,7 +1407,7 @@ mod tests {
             NOW,
         );
         assert!(matches!(&actions[..], [Action::Failed(text)] if text == "seq exhausted"));
-        assert!(!actions.iter().any(|a| matches!(a, Action::Send(_))));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Send(_, _))));
     }
 
     #[test]
