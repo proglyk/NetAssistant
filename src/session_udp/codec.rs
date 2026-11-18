@@ -447,6 +447,11 @@ impl Envelope {
     }
 
     /// Whether the envelope is an answer of the device: an ack or an error.
+    ///
+    /// The machine matches the type itself, because an ack and an error are
+    /// different outcomes. The predicate exists for the unit tests, so a
+    /// normal build does not keep an unused method.
+    #[cfg(test)]
     pub fn is_reply(&self) -> bool {
         self.msg_type == MSG_TYPE_ACK || self.msg_type == MSG_TYPE_ERROR
     }
