@@ -245,6 +245,55 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
     out
 }
 
+/// Journal text of one frame: protocol §5.2 fields, one `name: value` per line.
+///
+/// `plain` is the open text of an encrypted frame. The ciphertext and the
+/// GCM tag are never written. Handshake frames ignore `plain`.
+pub fn format_frame_fields(frame: &Frame, plain: Option<&[u8]>) -> String {
+    let header = &frame.header;
+    let mut lines = vec![
+        "version: 1".to_string(),
+        format!(
+            "packet_type: {} (0x{:02X})",
+            header.packet_type.name(),
+            header.packet_type as u8
+        ),
+        format!("session_id: 0x{:04x}", header.session_id),
+        format!("seq_num: {}", header.seq_num),
+        format!("timestamp: {}", header.timestamp),
+    ];
+    match &frame.body {
+        Body::Hello { nonce_a } => lines.push(format!("nonce_a: {}", hex_bytes(nonce_a))),
+        Body::Challenge { nonce_b, proof_b } => {
+            lines.push(format!("nonce_b: {}", hex_bytes(nonce_b)));
+            lines.push(format!("proof_b: {}", hex_bytes(proof_b)));
+        }
+        Body::Response { proof_a } => lines.push(format!("proof_a: {}", hex_bytes(proof_a))),
+        Body::SessionOk => {}
+        Body::SessionErr { code } => lines.push(format!("error_code: 0x{code:02x}")),
+        Body::Encrypted { nonce, ciphertext } => {
+            lines.push(format!("nonce: {}", hex_bytes(nonce)));
+            let payload_length = ciphertext.len().saturating_sub(TAG_LEN);
+            lines.push(format!("payload_length: {payload_length}"));
+            if let Some(plain) = plain {
+                let text = String::from_utf8_lossy(plain);
+                lines.push(format!("payload: {text}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Parse datagram bytes into a frame.
 pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
     if buf.len() > MAX_DATAGRAM {
@@ -835,5 +884,63 @@ mod tests {
         let envelope = Envelope::parse(text).expect("the text is an envelope");
         assert_eq!(envelope.correlation_id, None);
         assert_eq!(envelope.result(), None);
+    }
+
+    #[test]
+    fn format_frame_fields_lists_the_header_and_the_body() {
+        let hello = Frame {
+            header: Header {
+                packet_type: PacketType::Hello,
+                session_id: 0,
+                seq_num: 0,
+                timestamp: 1_794_943_500,
+            },
+            body: Body::Hello {
+                nonce_a: [0xab; HANDSHAKE_NONCE_LEN],
+            },
+        };
+        let text = format_frame_fields(&hello, None);
+        assert_eq!(
+            text,
+            format!(
+                "version: 1\npacket_type: HELLO (0x01)\nsession_id: 0x0000\nseq_num: 0\ntimestamp: 1794943500\nnonce_a: {}",
+                "ab".repeat(HANDSHAKE_NONCE_LEN)
+            )
+        );
+
+        let err = Frame {
+            header: Header {
+                packet_type: PacketType::SessionErr,
+                session_id: 0,
+                seq_num: 0,
+                timestamp: 10,
+            },
+            body: Body::SessionErr { code: 0x03 },
+        };
+        assert!(format_frame_fields(&err, None).ends_with("\nerror_code: 0x03"));
+        assert!(!format_frame_fields(&err, None).contains("nonce"));
+
+        let mut ciphertext = b"hi".to_vec();
+        ciphertext.extend_from_slice(&[0u8; TAG_LEN]);
+        let close = Frame {
+            header: Header {
+                packet_type: PacketType::Close,
+                session_id: 0x5353,
+                seq_num: 1,
+                timestamp: 20,
+            },
+            body: Body::Encrypted {
+                nonce: [0x11; NONCE_LEN],
+                ciphertext,
+            },
+        };
+        let text = format_frame_fields(&close, Some(b"hi"));
+        assert!(text.contains("packet_type: CLOSE (0x1F)\n"));
+        assert!(text.contains("session_id: 0x5353\n"));
+        assert!(text.contains("seq_num: 1\n"));
+        assert!(text.contains(&format!("nonce: {}\n", "11".repeat(NONCE_LEN))));
+        assert!(text.contains("payload_length: 2\n"));
+        assert!(text.ends_with("payload: hi"));
+        assert!(!text.contains("cipher"));
     }
 }
