@@ -170,6 +170,9 @@ pub struct ConnectionTabState {
     /// 发送输入框（hex 模式）的十六进制编辑器状态，与 message_input 同步创建
     pub message_hex_editor: Option<Entity<HexEditorState>>,
     pub message_input_mode: String,
+    /// UDP Session: the handshake is over and the session is established.
+    /// The command form sends only then.
+    pub udp_session_ready: bool,
     pub auto_clear_input: bool,
     pub periodic_send_enabled: bool,
     pub periodic_interval_input: Option<Entity<InputState>>,
@@ -261,6 +264,8 @@ pub struct ConnectionTabState {
     pub mqtt_subscriptions: Vec<(String, Qos)>,
     /// 发送区：发布 topic 输入（publish 不允许通配符）
     pub mqtt_publish_topic_input: Entity<InputState>,
+    /// UDP Session: the name of the command to send (not JSON, not an object).
+    pub command_name_input: Entity<InputState>,
     /// 每 tab 共享的 MQTT 发布元数据 cell（规划 D-C/D-D）：与 `periodic_source.mqtt_meta`
     /// 为同一 Arc，是该 tab 全部发送入口（手动/周期/定时/逐行）topic/QoS/retain 的唯一真源；
     /// 非 MQTT tab 恒 None（引擎 `dispatch` 以「cell 是否为 Some」区分是否需要 meta）
@@ -354,6 +359,7 @@ impl ConnectionTabState {
                 )
             })),
             message_input_mode,
+            udp_session_ready: false,
             auto_clear_input: true,
             periodic_send_enabled: false,
             periodic_interval_input: {
@@ -424,6 +430,11 @@ impl ConnectionTabState {
             mqtt_publish_topic_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(t!("connection_tab.mqtt_publish_topic_placeholder").to_string())
+            }),
+            // UDP Session: the command name field. It keeps its text after a send.
+            command_name_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t!("connection_tab.command_name_label").to_string())
             }),
             mqtt_publish_meta_cell,
             mqtt_publish_qos: Qos::AtMostOnce,
@@ -1101,6 +1112,8 @@ impl<'a> ConnectionTab<'a> {
         let is_connected = self.tab_state.is_connected;
         let is_client = self.tab_state.connection_config.is_client();
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
+        let is_udp_session =
+            self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
 
         div()
             .flex()
@@ -1549,7 +1562,12 @@ impl<'a> ConnectionTab<'a> {
                                                         app.storage.update_connection(cfg);
                                                     }
                                                     // 转换型语义: 切模式时把输入内容整体互转(hex → 文本)
-                                                    app.convert_input_on_mode_switch(&tab_id_text, &from_mode, "text", window, cx);
+                                                    // Command 有自己的字段: 与它互转时编辑器缓冲区不动
+                                                    if crate::session_udp::send::converts_editor_on_switch(&from_mode, "text") {
+                                                        app.convert_input_on_mode_switch(&tab_id_text, &from_mode, "text", window, cx);
+                                                    }
+                                                    // 周期任务读到的模式必须跟上: 与 Command 互转时缓冲区不动
+                                                    app.sync_periodic_input_mode(&tab_id_text, "text");
                                                     cx.notify();
                                                 }
                                             })),
@@ -1593,7 +1611,12 @@ impl<'a> ConnectionTab<'a> {
                                                         app.storage.update_connection(cfg);
                                                     }
                                                     // 转换型语义: 切模式时把输入内容整体互转(文本 → hex)并规范化
-                                                    app.convert_input_on_mode_switch(&tab_id_hex, &from_mode, "hex", window, cx);
+                                                    // Command 有自己的字段: 与它互转时编辑器缓冲区不动
+                                                    if crate::session_udp::send::converts_editor_on_switch(&from_mode, "hex") {
+                                                        app.convert_input_on_mode_switch(&tab_id_hex, &from_mode, "hex", window, cx);
+                                                    }
+                                                    // 周期任务读到的模式必须跟上: 与 Command 互转时缓冲区不动
+                                                    app.sync_periodic_input_mode(&tab_id_hex, "hex");
                                                     // 切到 hex 后聚焦编辑器: 光标立刻可见, 可直接键入
                                                     if let Some(tab_state) = app.connection_tabs.get(&tab_id_hex) {
                                                         if let Some(editor) = tab_state.message_hex_editor.as_ref() {
@@ -1604,7 +1627,58 @@ impl<'a> ConnectionTab<'a> {
                                                     cx.notify();
                                                 }
                                             })),
-                                    ),
+                                    )
+                                    // Command 模式只在 UDP Session 上存在: 它有自己的字段
+                                    .when(is_udp_session, |this| {
+                                        this.child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .when(self.tab_state.message_input_mode == "command", |div| {
+                                                    div.bg(theme.primary)
+                                                        .text_color(theme.primary_foreground)
+                                                        .hover(|style| style.bg(theme.primary_hover))
+                                                })
+                                                .when(self.tab_state.message_input_mode != "command", |div| {
+                                                    div.bg(theme.secondary)
+                                                        .text_color(theme.muted_foreground)
+                                                        .hover(|style| style.bg(theme.border))
+                                                })
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .child(t!("connection_tab.mode_command").to_string()),
+                                                )
+                                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                                    let tab_id_cmd = tab_id.clone();
+                                                    move |app, _event, window, cx| {
+                                                        let mut from_mode = String::new();
+                                                        let updated = app.connection_tabs.get_mut(&tab_id_cmd).map(|tab_state| {
+                                                            from_mode = tab_state.message_input_mode.clone();
+                                                            tab_state.message_input_mode = String::from("command");
+                                                            match &mut tab_state.connection_config {
+                                                                ConnectionConfig::Client(c) => c.message_input_mode = "command".to_string(),
+                                                                ConnectionConfig::Server(c) => c.message_input_mode = "command".to_string(),
+                                                            }
+                                                            tab_state.connection_config.clone()
+                                                        });
+                                                        if let Some(cfg) = updated {
+                                                            app.storage.update_connection(cfg);
+                                                        }
+                                                        // Command 有自己的字段: 编辑器缓冲区不转换
+                                                        if crate::session_udp::send::converts_editor_on_switch(&from_mode, "command") {
+                                                            app.convert_input_on_mode_switch(&tab_id_cmd, &from_mode, "command", window, cx);
+                                                        }
+                                                        // 周期任务读到的模式必须跟上: 与 Command 互转时缓冲区不动
+                                                        app.sync_periodic_input_mode(&tab_id_cmd, "command");
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                    }),
                             ),
                     ),
             )
@@ -3323,9 +3397,35 @@ impl<'a> ConnectionTab<'a> {
         let is_mqtt = self.tab_state.connection_config.protocol() == ConnectionType::Mqtt;
         let is_udp_session =
             self.tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+        // Command 模式只在 UDP Session 上存在: 这一行取代编辑器与工具条
+        let command_mode = is_udp_session && self.tab_state.message_input_mode == "command";
         // 与 MQTT 同理：会话语义下 trailer 与发送任务都收起
         let hide_stream_tools = is_mqtt || is_udp_session;
         let selected_client = &self.tab_state.selected_client;
+
+        // Command 模式: 一行取代编辑器(两枚命令按钮 + 命令名字段)
+        let editor_slot: Div = if command_mode {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(self.render_command_row(&theme, cx))
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(self.render_input_with_mode(
+                    self.tab_state.message_input.as_ref().unwrap(),
+                    self.tab_state.message_hex_editor.as_ref(),
+                    &self.tab_state.message_input_mode,
+                    &theme,
+                    window,
+                    cx,
+                ))
+        };
 
         div()
             .flex()
@@ -3353,23 +3453,7 @@ impl<'a> ConnectionTab<'a> {
                 is_client && self.tab_state.connection_config.protocol() == ConnectionType::Mqtt,
                 |el| el.child(self.render_mqtt_publish_row(&theme, cx)),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        self.render_input_with_mode(
-                            self.tab_state.message_input.as_ref().unwrap(),
-                            self.tab_state.message_hex_editor.as_ref(),
-                            &self.tab_state.message_input_mode,
-                            &theme,
-                            window,
-                            cx,
-                        ),
-                    ),
-            )
+            .child(editor_slot)
             .child(
                 div()
                     .relative()
@@ -3383,253 +3467,257 @@ impl<'a> ConnectionTab<'a> {
                             .flex_wrap() // 允许内部元素自动换行
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .id("open-file-btn")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(theme.secondary)
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|style| {
-                                        style.bg(theme.secondary_hover)
-                                    })
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new(t!("connection_tab.open_file_tooltip").to_string()).build(window, cx)
-                                    })
-                                    .on_mouse_down(MouseButton::Left, cx.listener({
-                                        let tab_id = tab_id.clone();
-                                        move |app: &mut NetAssistantApp, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<NetAssistantApp>| {
-                                            // 打开「从文件导入」对话框：选文件 → 选编码 → 确定回填发送框
-                                            app.open_import_file_dialog_for_tab(tab_id.clone(), window, cx);
-                                        }
-                                    }))
+                            // Command 模式没有编辑器: 这些作用于编辑器的工具全部收起
+                            .when(!command_mode, |this| {
+                                this
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .font_medium()
-                                            .text_color(theme.secondary_foreground)
-                                            .child(t!("connection_tab.open_file").to_string()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(theme.secondary)
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|style| {
-                                        style.bg(theme.secondary_hover)
-                                    })
-                                    .on_mouse_down(MouseButton::Left, cx.listener({
-                                        let tab_id = tab_id.clone();
-                                        move |app: &mut NetAssistantApp, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<NetAssistantApp>| {
-                                            // 清空输入框内容
-                                            if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id) {
-                                                if let Some(message_input) = &tab_state.message_input {
-                                                    message_input.update(cx, |input: &mut EditorState, cx| {
-                                                        input.set_value("", window, cx);
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.secondary_foreground)
-                                        .child(t!("connection_tab.clear").to_string()),
-                                ),
-                            )
-                            .child({
-                                // 「插入变量」按钮: 切换浮层显隐, on_prepaint 追踪位置供浮层锚定
-                                let prepaint_entity = cx.entity().clone();
-                                let prepaint_tab_id = tab_id.clone();
-                                let prepaint_handler: Box<
-                                    dyn Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
-                                > = Box::new(move |bounds, _window, cx| {
-                                    prepaint_entity.update(cx, |app, _| {
-                                        if let Some(tab_state) =
-                                            app.connection_tabs.get_mut(&prepaint_tab_id)
-                                        {
-                                            tab_state.message_var_button_bounds = Some(bounds);
-                                        }
-                                    });
-                                });
-                                let toggle_tab_id = tab_id.clone();
-                                div()
-                                    // on_prepaint 需挂在 Div 上(ElementExt 仅对 ParentElement 实现),
-                                    // 必须在 .id()/.tooltip() 转为 Stateful 之前调用
-                                    .on_prepaint(prepaint_handler)
-                                    .id("insert-var-btn")
-                                    .px_3()
-                                    .py_1()
-                                    .bg(theme.secondary)
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme.secondary_hover))
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new(
-                                            t!("connection_tab.insert_variable_tooltip").to_string(),
-                                        )
-                                        .build(window, cx)
-                                    })
-                                    .on_mouse_down(MouseButton::Left, cx.listener(
-                                        move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
-                                            if let Some(tab_state) = app.connection_tabs.get_mut(&toggle_tab_id) {
-                                                tab_state.variable_picker_target =
-                                                    if tab_state.variable_picker_target == Some(VariablePickerTarget::Message) {
-                                                        None
-                                                    } else {
-                                                        Some(VariablePickerTarget::Message)
-                                                    };
-                                            }
-                                            cx.notify();
-                                        },
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_medium()
-                                            .text_color(theme.secondary_foreground)
-                                            .child(t!("connection_tab.insert_variable").to_string()),
-                                    )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w_4()
-                                            .h_4()
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .rounded(px(4.))
+                                            .id("open-file-btn")
+                                            .px_3()
+                                            .py_1()
+                                            .bg(theme.secondary)
+                                            .rounded_md()
                                             .cursor_pointer()
-                                            .when(self.tab_state.auto_clear_input, |this| {
-                                                this.bg(theme.primary)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(theme.primary_foreground)
-                                                            .font_bold()
-                                                            .child("✓"),
-                                                    )
+                                            .hover(|style| {
+                                                style.bg(theme.secondary_hover)
+                                            })
+                                            .tooltip(|window, cx| {
+                                                Tooltip::new(t!("connection_tab.open_file_tooltip").to_string()).build(window, cx)
                                             })
                                             .on_mouse_down(MouseButton::Left, cx.listener({
-                                                let tab_id_auto_clear = tab_id_auto_clear.clone();
-                                                move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
-                                                    // 获取当前标签页的状态
-                                                    let mut turned_on = false;
-                                                    if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id_auto_clear) {
-                                                        tab_state.auto_clear_input = !tab_state.auto_clear_input;
-                                                        // 互斥逻辑：勾选自动清除时禁用周期发送
-                                                        if tab_state.auto_clear_input {
-                                                            tab_state.periodic_send_enabled = false;
-                                                            turned_on = true;
-                                                        }
-                                                    }
-                                                    // 互斥关闭周期发送时, 同步停止并移除运行中的周期发送任务, 避免后台继续发送
-                                                    if turned_on {
-                                                        app.stop_periodic_task(&tab_id_auto_clear, cx);
-                                                    }
-                                                    cx.notify();
+                                                let tab_id = tab_id.clone();
+                                                move |app: &mut NetAssistantApp, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<NetAssistantApp>| {
+                                                    // 打开「从文件导入」对话框：选文件 → 选编码 → 确定回填发送框
+                                                    app.open_import_file_dialog_for_tab(tab_id.clone(), window, cx);
                                                 }
-                                            })),
+                                            }))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(theme.secondary_foreground)
+                                                    .child(t!("connection_tab.open_file").to_string()),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(t!("connection_tab.auto_clear").to_string()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w_4()
-                                            .h_4()
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .rounded(px(4.))
+                                            .px_3()
+                                            .py_1()
+                                            .bg(theme.secondary)
+                                            .rounded_md()
                                             .cursor_pointer()
-                                            .when(self.tab_state.periodic_send_enabled, |this| {
-                                                this.bg(theme.primary)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(theme.primary_foreground)
-                                                            .font_bold()
-                                                            .child("✓"),
-                                                    )
+                                            .hover(|style| {
+                                                style.bg(theme.secondary_hover)
                                             })
                                             .on_mouse_down(MouseButton::Left, cx.listener({
-                                                let tab_id_periodic = tab_id_periodic.clone();
-                                                move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
-                                                    // 获取当前标签页的状态
-                                                    if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id_periodic) {
-                                                        tab_state.periodic_send_enabled = !tab_state.periodic_send_enabled;
-                                                        // 互斥逻辑：勾选周期发送时禁用自动清除
-                                                        if tab_state.periodic_send_enabled {
-                                                            tab_state.auto_clear_input = false;
+                                                let tab_id = tab_id.clone();
+                                                move |app: &mut NetAssistantApp, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<NetAssistantApp>| {
+                                                    // 清空输入框内容
+                                                    if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id) {
+                                                        if let Some(message_input) = &tab_state.message_input {
+                                                            message_input.update(cx, |input: &mut EditorState, cx| {
+                                                                input.set_value("", window, cx);
+                                                            });
                                                         }
                                                     }
-                                                    // 取消勾选: 停止并移除周期发送任务(若在跑)
-                                                    let still_enabled = app
-                                                        .connection_tabs
-                                                        .get(&tab_id_periodic)
-                                                        .map(|t| t.periodic_send_enabled)
-                                                        .unwrap_or(false);
-                                                    if !still_enabled {
-                                                        app.stop_periodic_task(&tab_id_periodic, cx);
-                                                    }
-                                                    cx.notify();
                                                 }
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(t!("connection_tab.periodic_send").to_string()),
-                                    )
-                                    // 只有在周期发送选中时才显示时间间隔输入框
-                                    .when(self.tab_state.periodic_send_enabled, |builder| {
-                                        builder.child(
+                                            }))
+                                        .child(
                                             div()
-                                                .w_20()
-                                                .min_w_16()
-                                                .h_7()
-                                                .bg(theme.secondary)
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .child(
-                                                    Input::new(self.tab_state.periodic_interval_input.as_ref().unwrap())
-                                                        .w_full()
-                                                        .h_full()
+                                                .text_xs()
+                                                .font_medium()
+                                                .text_color(theme.secondary_foreground)
+                                                .child(t!("connection_tab.clear").to_string()),
+                                        ),
+                                    )
+                                    .child({
+                                        // 「插入变量」按钮: 切换浮层显隐, on_prepaint 追踪位置供浮层锚定
+                                        let prepaint_entity = cx.entity().clone();
+                                        let prepaint_tab_id = tab_id.clone();
+                                        let prepaint_handler: Box<
+                                            dyn Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
+                                        > = Box::new(move |bounds, _window, cx| {
+                                            prepaint_entity.update(cx, |app, _| {
+                                                if let Some(tab_state) =
+                                                    app.connection_tabs.get_mut(&prepaint_tab_id)
+                                                {
+                                                    tab_state.message_var_button_bounds = Some(bounds);
+                                                }
+                                            });
+                                        });
+                                        let toggle_tab_id = tab_id.clone();
+                                        div()
+                                            // on_prepaint 需挂在 Div 上(ElementExt 仅对 ParentElement 实现),
+                                            // 必须在 .id()/.tooltip() 转为 Stateful 之前调用
+                                            .on_prepaint(prepaint_handler)
+                                            .id("insert-var-btn")
+                                            .px_3()
+                                            .py_1()
+                                            .bg(theme.secondary)
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(theme.secondary_hover))
+                                            .tooltip(|window, cx| {
+                                                Tooltip::new(
+                                                    t!("connection_tab.insert_variable_tooltip").to_string(),
+                                                )
+                                                .build(window, cx)
+                                            })
+                                            .on_mouse_down(MouseButton::Left, cx.listener(
+                                                move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
+                                                    if let Some(tab_state) = app.connection_tabs.get_mut(&toggle_tab_id) {
+                                                        tab_state.variable_picker_target =
+                                                            if tab_state.variable_picker_target == Some(VariablePickerTarget::Message) {
+                                                                None
+                                                            } else {
+                                                                Some(VariablePickerTarget::Message)
+                                                            };
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(theme.secondary_foreground)
+                                                    .child(t!("connection_tab.insert_variable").to_string()),
+                                            )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .w_4()
+                                                    .h_4()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .rounded(px(4.))
+                                                    .cursor_pointer()
+                                                    .when(self.tab_state.auto_clear_input, |this| {
+                                                        this.bg(theme.primary)
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(theme.primary_foreground)
+                                                                    .font_bold()
+                                                                    .child("✓"),
+                                                            )
+                                                    })
+                                                    .on_mouse_down(MouseButton::Left, cx.listener({
+                                                        let tab_id_auto_clear = tab_id_auto_clear.clone();
+                                                        move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
+                                                            // 获取当前标签页的状态
+                                                            let mut turned_on = false;
+                                                            if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id_auto_clear) {
+                                                                tab_state.auto_clear_input = !tab_state.auto_clear_input;
+                                                                // 互斥逻辑：勾选自动清除时禁用周期发送
+                                                                if tab_state.auto_clear_input {
+                                                                    tab_state.periodic_send_enabled = false;
+                                                                    turned_on = true;
+                                                                }
+                                                            }
+                                                            // 互斥关闭周期发送时, 同步停止并移除运行中的周期发送任务, 避免后台继续发送
+                                                            if turned_on {
+                                                                app.stop_periodic_task(&tab_id_auto_clear, cx);
+                                                            }
+                                                            cx.notify();
+                                                        }
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(t!("connection_tab.auto_clear").to_string()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .w_4()
+                                                    .h_4()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .rounded(px(4.))
+                                                    .cursor_pointer()
+                                                    .when(self.tab_state.periodic_send_enabled, |this| {
+                                                        this.bg(theme.primary)
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(theme.primary_foreground)
+                                                                    .font_bold()
+                                                                    .child("✓"),
+                                                            )
+                                                    })
+                                                    .on_mouse_down(MouseButton::Left, cx.listener({
+                                                        let tab_id_periodic = tab_id_periodic.clone();
+                                                        move |app: &mut NetAssistantApp, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<NetAssistantApp>| {
+                                                            // 获取当前标签页的状态
+                                                            if let Some(tab_state) = app.connection_tabs.get_mut(&tab_id_periodic) {
+                                                                tab_state.periodic_send_enabled = !tab_state.periodic_send_enabled;
+                                                                // 互斥逻辑：勾选周期发送时禁用自动清除
+                                                                if tab_state.periodic_send_enabled {
+                                                                    tab_state.auto_clear_input = false;
+                                                                }
+                                                            }
+                                                            // 取消勾选: 停止并移除周期发送任务(若在跑)
+                                                            let still_enabled = app
+                                                                .connection_tabs
+                                                                .get(&tab_id_periodic)
+                                                                .map(|t| t.periodic_send_enabled)
+                                                                .unwrap_or(false);
+                                                            if !still_enabled {
+                                                                app.stop_periodic_task(&tab_id_periodic, cx);
+                                                            }
+                                                            cx.notify();
+                                                        }
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(t!("connection_tab.periodic_send").to_string()),
+                                            )
+                                            // 只有在周期发送选中时才显示时间间隔输入框
+                                            .when(self.tab_state.periodic_send_enabled, |builder| {
+                                                builder.child(
+                                                    div()
+                                                        .w_20()
+                                                        .min_w_16()
+                                                        .h_7()
                                                         .bg(theme.secondary)
                                                         .rounded_md()
-                                                        .border_0()
-                                                        .text_center(),
-                                                ),
-                                        )
-                                    }),
-                            )
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .child(
+                                                            Input::new(self.tab_state.periodic_interval_input.as_ref().unwrap())
+                                                                .w_full()
+                                                                .h_full()
+                                                                .bg(theme.secondary)
+                                                                .rounded_md()
+                                                                .border_0()
+                                                                .text_center(),
+                                                        ),
+                                                )
+                                            }),
+                                    )
+                            })
                             // MQTT 隐藏 trailer 下拉(配置层强制 None, 规划 D-7)与发送任务按钮(D-8)
                             // UDP Session 同理：DATA 载荷不可被追加字节污染
                             .when(!hide_stream_tools, |this| {
@@ -3688,10 +3776,13 @@ impl<'a> ConnectionTab<'a> {
                             })
                             // 发送任务: 图标按钮(状态色 + 角标) + 逐行发送任务面板。
                             // MQTT 也放开(规划 D-C): 发布 topic/QoS/retain 由每 tab 共享 cell 兜底补齐
-                            .child(
-                                SendTaskPanel::new(tab_id.clone(), self.tab_state)
-                                    .render_button(&theme, cx),
-                            ),
+                            // Command 模式没有编辑器可逐行发送: 按钮收起
+                            .when(!command_mode, |this| {
+                                this.child(
+                                    SendTaskPanel::new(tab_id.clone(), self.tab_state)
+                                        .render_button(&theme, cx),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -3764,6 +3855,81 @@ impl<'a> ConnectionTab<'a> {
                                     ),
                             ),
                     ),
+            )
+    }
+
+    /// The Command form: two command buttons and the command name field.
+    ///
+    /// It replaces the editor and the editor tools while the mode is `command`.
+    /// A button carries the command name as its label and as its payload; the
+    /// field carries whatever the user typed and goes out by the Send button.
+    fn render_command_row(&self, theme: &Theme, cx: &mut Context<NetAssistantApp>) -> Div {
+        let tab_id = self.tab_id.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.render_command_button(theme, &tab_id, "get_status", cx))
+            .child(self.render_command_button(theme, &tab_id, "get_capabilities", cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("connection_tab.command_name_label").to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.tab_state.command_name_input)),
+            )
+    }
+
+    /// One named command button.
+    ///
+    /// The click does nothing while the session is not established: the
+    /// machine refuses a command outside `Established` anyway.
+    fn render_command_button(
+        &self,
+        theme: &Theme,
+        tab_id: &str,
+        cmd: &str,
+        cx: &mut Context<NetAssistantApp>,
+    ) -> impl IntoElement {
+        let tab_id = tab_id.to_string();
+        let cmd = cmd.to_string();
+        let label = cmd.clone();
+        div()
+            .id(format!("cmd-btn-{}-{}", cmd, tab_id))
+            .px_3()
+            .py_1()
+            .bg(theme.secondary)
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.secondary_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let tab_id = tab_id.clone();
+                    let cmd = cmd.clone();
+                    move |app, _event, _window, _cx| {
+                        let ready = app
+                            .connection_tabs
+                            .get(&tab_id)
+                            .map(|tab_state| tab_state.udp_session_ready)
+                            .unwrap_or(false);
+                        if crate::session_udp::send::command_click(ready) {
+                            app.send_session_command(&tab_id, cmd.clone());
+                        }
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.secondary_foreground)
+                    .child(label),
             )
     }
 }

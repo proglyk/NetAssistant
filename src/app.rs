@@ -1403,6 +1403,14 @@ impl NetAssistantApp {
             }
         }
         // 同步周期发送的实时模式: 正在跑的 hidden 任务下一轮即按新模式渲染
+        self.sync_periodic_input_mode(tab_id, to_mode);
+    }
+
+    /// 同步周期发送的实时模式, 与编辑器缓冲区分开。
+    ///
+    /// 与 Command 模式互转时缓冲区不动(命令有自己的字段), 但周期任务读到的
+    /// 模式必须跟上: 否则它会把 hex 文本当作文本发出去。
+    pub fn sync_periodic_input_mode(&mut self, tab_id: &str, to_mode: &str) {
         if let Some(tab) = self.connection_tabs.get(tab_id) {
             tab.periodic_source.set_hex_mode(to_mode == "hex");
         }
@@ -3619,6 +3627,29 @@ impl NetAssistantApp {
         let mut interval_ms: u64 = 1000;
         let mut message_seq: Option<Arc<AtomicU64>> = None;
 
+        // UDP Session command mode: the machine builds the envelope, so the
+        // editor bytes are not sent at all.
+        let command_decision = self.connection_tabs.get(tab_id).map(|tab_state| {
+            let is_udp_session =
+                tab_state.connection_config.protocol() == ConnectionType::UdpSession;
+            let field = tab_state.command_name_input.read(cx).value().to_string();
+            crate::session_udp::send::session_send(
+                is_udp_session,
+                &tab_state.message_input_mode,
+                tab_state.udp_session_ready,
+                &field,
+            )
+        });
+        match command_decision {
+            Some(crate::session_udp::send::SessionSend::Command(cmd)) => {
+                self.send_session_command(tab_id, cmd);
+                return;
+            }
+            // The session is not open or the field is empty: nothing is sent.
+            Some(crate::session_udp::send::SessionSend::Drop) => return,
+            _ => {}
+        }
+
         // 获取当前标签页的状态
         if let Some(tab_state) = self.connection_tabs.get_mut(tab_id) {
             // 获取消息输入内容
@@ -3889,6 +3920,25 @@ impl NetAssistantApp {
             tab_id, bytes, hex_input
         );
         self.send_dispatch_with_errors(tab_id, bytes, mqtt_meta);
+    }
+
+    /// Send a UDP Session command name to the state machine.
+    ///
+    /// The name travels as a marked wire: the session loop builds the
+    /// envelope. The message list gets no second bubble — the purple sender
+    /// line of the machine carries the envelope.
+    pub fn send_session_command(&mut self, tab_id: &str, cmd: String) {
+        let Some(tab_state) = self.connection_tabs.get(tab_id) else {
+            return;
+        };
+        if !tab_state.is_connected || !tab_state.udp_session_ready {
+            return;
+        }
+        let Some(write_sender) = self.client_write_senders.get(tab_id) else {
+            return;
+        };
+        let wire = WireMessage::session_command(cmd.into_bytes());
+        let _ = write_sender.try_send(wire);
     }
 
     /// 发送一条消息到 tab 的目标(客户端 / 服务端定向 / 服务端广播), 并回传 Sent 簿记事件。
@@ -5267,6 +5317,8 @@ impl NetAssistantApp {
             ConnectionEvent::Disconnected(tab_id) => {
                 if let Some(tab_state) = self.connection_tabs.get_mut(&tab_id) {
                     tab_state.is_connected = false;
+                    // The UDP Session is over: the command form is closed.
+                    tab_state.udp_session_ready = false;
                     // 终态错误(MQTT 首连失败 / broker 主动断开)已由 Error 给出更准确的状态与原因,
                     // 且不会自动重连; 若被紧随其后的 Disconnected 覆盖成普通"已断开", 二者将无法区分
                     if tab_state.connection_status != ConnectionStatus::Error {
@@ -5299,6 +5351,13 @@ impl NetAssistantApp {
                 // 开始监听: 若有持久化的定时任务(心跳)则创建
                 self.ensure_timed_task(&tab_id, cx);
             }
+            ConnectionEvent::SessionReady(tab_id) => {
+                // The UDP Session handshake is over: the command form may send.
+                if let Some(tab_state) = self.connection_tabs.get_mut(&tab_id) {
+                    tab_state.udp_session_ready = true;
+                    cx.notify();
+                }
+            }
             ConnectionEvent::StatusHint(tab_id, hint) => {
                 // 非错误提示: 成功色 + 到期自动消失。顺手清掉重连期间的旧告警
                 // (如"自动重连中"), 避免过时红字与正常提示并存。
@@ -5318,6 +5377,8 @@ impl NetAssistantApp {
             ConnectionEvent::Error(tab_id, error) => {
                 if let Some(tab_state) = self.connection_tabs.get_mut(&tab_id) {
                     tab_state.is_connected = false;
+                    // The UDP Session is over: the command form is closed.
+                    tab_state.udp_session_ready = false;
                     tab_state.connection_status = ConnectionStatus::Error;
                     tab_state.error_message = Some(error);
                     tab_state.local_endpoint = None;
