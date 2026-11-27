@@ -15,8 +15,8 @@
 use crate::session_udp::codec::{
     Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, DecodeError, Envelope, Frame,
     HANDSHAKE_NONCE_LEN, HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR,
-    PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, command_envelope, decode, header_bytes,
-    nonce_matches, proof_a_input, proof_b_input,
+    PacketType, Push, TIMESTAMP_WINDOW_SECONDS, build_nonce, command_envelope, decode,
+    header_bytes, nonce_matches, parse_push, proof_a_input, proof_b_input,
 };
 use crate::session_udp::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
@@ -70,7 +70,7 @@ pub enum Command {
         /// the machine, which has no random source of its own.
         msg_id: String,
         /// The identifier of the device the command goes to (protocol §2.1).
-        /// An empty one is left out of the envelope.
+        /// An empty one stops the command: the server refuses it.
         device_id: String,
     },
     /// The user disconnected.
@@ -99,11 +99,25 @@ pub enum ReplyOutcome {
     Ack {
         /// The result of the answer.
         result: Option<String>,
+        /// The state of the device after the command.
+        device_state: Option<String>,
+        /// The warnings of the answer.
+        warnings: Option<Vec<String>>,
+        /// The product-specific data of the answer, as compact JSON.
+        data: Option<String>,
     },
     /// The device refused the command: "E_INVALID_CMD", ...
     Error {
         /// The code of the error.
         code: Option<String>,
+        /// The severity of the error: "info", "warning", "error", "critical".
+        severity: Option<String>,
+        /// The human-readable text of the error.
+        message: Option<String>,
+        /// Whether the command may be repeated.
+        retryable: Option<bool>,
+        /// The additional data of the error, as compact JSON.
+        details: Option<String>,
     },
 }
 
@@ -114,6 +128,66 @@ pub struct CommandReply {
     pub outcome: ReplyOutcome,
     /// The command the answer belongs to; known when the correlation matched.
     pub command: Option<PendingCommand>,
+}
+
+/// The fields of an answer, for the journal line (protocol §2.5.2, §2.5.3).
+///
+/// The name of a field is an identifier of the protocol and is never
+/// translated; the wording of the line belongs to the client. A field the
+/// device did not send stays out: the journal shows what the device said,
+/// not what it could have said.
+pub fn reply_fields(reply: &CommandReply) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    match &reply.outcome {
+        ReplyOutcome::Ack {
+            result,
+            device_state,
+            warnings,
+            data,
+        } => {
+            push_field(&mut fields, "result", result.as_deref());
+            push_field(&mut fields, "device_state", device_state.as_deref());
+            // The warnings are a list: as a JSON array the elements stay apart
+            // and the ones that carry a quote are escaped.
+            let warnings_json = warnings
+                .as_ref()
+                .filter(|list| !list.is_empty())
+                .and_then(|list| serde_json::to_string(list).ok());
+            if let Some(json) = warnings_json {
+                fields.push(("warnings".to_string(), json));
+            }
+            // The data of the answer is JSON already: the codec keeps it as
+            // the compact text of the value.
+            push_field(&mut fields, "data", data.as_deref());
+        }
+        ReplyOutcome::Error {
+            code,
+            severity,
+            message,
+            retryable,
+            details,
+        } => {
+            push_field(&mut fields, "code", code.as_deref());
+            push_field(&mut fields, "severity", severity.as_deref());
+            push_field(&mut fields, "message", message.as_deref());
+            if let Some(retryable) = retryable {
+                fields.push(("retryable".to_string(), retryable.to_string()));
+            }
+            push_field(&mut fields, "details", details.as_deref());
+        }
+    }
+    fields
+}
+
+/// A field of the answer: an absent value and an empty one stay out.
+fn push_field(fields: &mut Vec<(String, String)>, name: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    fields.push((name.to_string(), value.to_string()));
 }
 
 /// Protocol event: the client turns it into a log line with a stage.
@@ -147,6 +221,11 @@ pub enum Trace {
     },
     /// The session key was derived and the session is open (session stage).
     SessionOpen,
+    /// A push of the device: a status snapshot or an event (push stage).
+    Push {
+        /// The parsed push.
+        push: Push,
+    },
 }
 
 /// State machine output.
@@ -547,9 +626,16 @@ impl Machine {
                 actions
             }
             PacketType::Push => {
-                // The body of a push is not parsed: the snapshots and the
-                // events are not in the scope of the client yet (spec F).
-                vec![Action::Deliver(plain)]
+                // The open text of a push goes to the journal as it is, and
+                // the parsed push comes aside: the journal shows the fields
+                // of the snapshot (push stage). A text that is not a push has
+                // no fields to show: the decoder line keeps it.
+                let push = parse_push(&plain);
+                let mut actions = vec![Action::Deliver(plain)];
+                if let Some(push) = push {
+                    actions.push(Action::Trace(Trace::Push { push }));
+                }
+                actions
             }
             PacketType::Close => {
                 // The peer closed the session: the reason is read from the
@@ -618,9 +704,16 @@ impl Machine {
         let outcome = match envelope.msg_type.as_str() {
             MSG_TYPE_ACK => ReplyOutcome::Ack {
                 result: envelope.result().map(str::to_string),
+                device_state: envelope.device_state().map(str::to_string),
+                warnings: envelope.warnings(),
+                data: envelope.data().map(|value| value.to_string()),
             },
             MSG_TYPE_ERROR => ReplyOutcome::Error {
                 code: envelope.error_code().map(str::to_string),
+                severity: envelope.error_severity().map(str::to_string),
+                message: envelope.error_message().map(str::to_string),
+                retryable: envelope.error_retryable(),
+                details: envelope.error_details().map(|value| value.to_string()),
             },
             _ => return None,
         };
@@ -643,7 +736,7 @@ impl Machine {
         let index = pending.iter().position(|known| known.msg_id == msg_id)?;
         let terminal = match outcome {
             ReplyOutcome::Error { .. } => true,
-            ReplyOutcome::Ack { result } => result
+            ReplyOutcome::Ack { result, .. } => result
                 .as_deref()
                 .is_some_and(|result| TERMINAL_RESULTS.contains(&result)),
         };
@@ -694,7 +787,10 @@ impl Machine {
     /// sends it as the body of a `DATA` frame.
     ///
     /// The name is trimmed and an empty one is refused before any datagram:
-    /// the counter of the session grows only for an accepted command.
+    /// the counter of the session grows only for an accepted command. The
+    /// device id is trimmed as well: an empty one is refused, because the
+    /// server would answer `E_INVALID_CMD` and the command would never get
+    /// an answer.
     fn on_send_command(
         &mut self,
         cmd: String,
@@ -709,11 +805,17 @@ impl Machine {
         if !matches!(self.state, State::Established { .. }) {
             return vec![Action::Warn("not established".to_string())];
         }
+        // The device id is a setting of the connection. Without it the server
+        // does not accept the command, so the frame must not leave the client.
+        let device_id = device_id.trim();
+        if device_id.is_empty() {
+            return vec![Action::Warn("device id is not set".to_string())];
+        }
         let seq = match &self.state {
             State::Established { json_seq, .. } => *json_seq,
             _ => return Vec::new(),
         };
-        let body = command_envelope(&msg_id, &device_id, &format_ts_utc(now), seq, &name);
+        let body = command_envelope(&msg_id, device_id, &format_ts_utc(now), seq, &name);
         let actions = self.on_user_bytes(body, nonce_tail, now);
         let sent = actions
             .iter()
@@ -876,7 +978,7 @@ fn normalize_sent_name(cmd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_udp::codec::{PROOF_LEN, encode, format_frame_fields};
+    use crate::session_udp::codec::{PROOF_LEN, PushKind, encode, format_frame_fields};
     use crate::session_udp::crypto::NONCE_LEN;
 
     const PSK: &str = "super-secret-psk";
@@ -1471,12 +1573,63 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::Deliver(p) if p == b"snapshot"))
         );
+        // A text that is not a push has no fields to show: the journal keeps
+        // the raw text in the decoder line, and no push line appears.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace(Trace::Push { .. })))
+        );
         // The session is still open: a DATA frame is still delivered.
         let actions = m.handle(Command::Packet(device_data(2, b"more")), NOW);
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::Deliver(p) if p == b"more"))
+        );
+    }
+
+    #[test]
+    fn a_push_frame_that_is_not_a_push_has_no_push_trace() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // An envelope of another kind: the type is neither "status" nor
+        // "event", so the body is not a push and there is nothing to show in
+        // the push line.
+        let plain = br#"{"msg_type":"ack","payload":{}}"#;
+        let frame = device_frame(PacketType::Push, 1, NOW, plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == plain))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace(Trace::Push { .. })))
+        );
+    }
+
+    #[test]
+    fn a_push_frame_carries_the_parsed_push() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let plain =
+            br#"{"msg_type":"status","msg_id":"status-1","payload":{"mcu_connected":true}}"#;
+        let frame = device_frame(PacketType::Push, 1, NOW, plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        let push = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Trace(Trace::Push { push }) => Some(push),
+                _ => None,
+            })
+            .expect("the frame carries a push");
+        assert_eq!(push.kind, PushKind::Status);
+        assert!(
+            push.fields
+                .contains(&("mcu_connected".to_string(), "true".to_string()))
         );
     }
 
@@ -1703,7 +1856,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Reply(CommandReply {
-                outcome: ReplyOutcome::Ack { result: Some(result) },
+                outcome: ReplyOutcome::Ack { result: Some(result), .. },
                 command: None,
             }) if result.as_str() == "applied"
         )));
@@ -1719,7 +1872,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Reply(CommandReply {
-                outcome: ReplyOutcome::Error { code: Some(code) },
+                outcome: ReplyOutcome::Error { code: Some(code), .. },
                 command: None,
             }) if code.as_str() == "E_INVALID_CMD"
         )));
@@ -1912,11 +2065,17 @@ mod tests {
 
     /// A command of the user with the identity of the message.
     fn send_command(cmd: &str) -> Command {
+        send_command_for(cmd, DEVICE_ID)
+    }
+
+    /// A command of the user with the identity of the message and the device
+    /// of the given id.
+    fn send_command_for(cmd: &str, device_id: &str) -> Command {
         Command::SendCommand {
             cmd: cmd.to_string(),
             nonce_tail: tail(),
             msg_id: MSG_ID.to_string(),
-            device_id: DEVICE_ID.to_string(),
+            device_id: device_id.to_string(),
         }
     }
 
@@ -1938,6 +2097,28 @@ mod tests {
         let text = format_frame_fields(sent(&actions), Some(&plain_of(&actions)));
         assert!(text.contains("payload: "));
         assert!(text.contains("get_status"));
+    }
+
+    #[test]
+    fn a_command_without_a_device_id_is_not_sent() {
+        for device_id in ["", "   "] {
+            let mut m = Machine::new();
+            establish(&mut m);
+            let actions = m.handle(send_command_for("get_status", device_id), NOW);
+            assert!(
+                matches!(&actions[..], [Action::Warn(text)] if text == "device id is not set"),
+                "the command must not leave the client: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_device_id_is_trimmed_in_the_envelope() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(send_command_for("get_status", "  dev_00001A2B3C  "), NOW);
+        let value = envelope_of(&actions);
+        assert_eq!(value["device_id"], DEVICE_ID);
     }
 
     #[test]
@@ -2036,5 +2217,142 @@ mod tests {
                 command: None,
             })
         )));
+    }
+
+    #[test]
+    fn the_reply_carries_the_fields_of_the_answer() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(send_command("get_status"), NOW);
+        let plain =
+            br#"{"msg_type":"error","correlation_id":"550e8400-e29b-41d4-a716-446655440000",
+            "payload":{"code":"E_COMMAND_NOT_ALLOWED","severity":"error",
+            "message":"Command not allowed on UDP channel","retryable":false,
+            "details":{"command":"rotate_local_secret"}}}"#;
+        let actions = m.handle(Command::Packet(device_data(1, plain)), NOW);
+        let reply = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Reply(reply) => Some(reply),
+                _ => None,
+            })
+            .expect("the frame carries a reply");
+        assert_eq!(
+            reply.outcome,
+            ReplyOutcome::Error {
+                code: Some("E_COMMAND_NOT_ALLOWED".to_string()),
+                severity: Some("error".to_string()),
+                message: Some("Command not allowed on UDP channel".to_string()),
+                retryable: Some(false),
+                details: Some(r#"{"command":"rotate_local_secret"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_ack_carries_the_fields_of_the_answer() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(send_command("get_status"), NOW);
+        let plain = serde_json::json!({
+            "msg_type": "ack",
+            "correlation_id": MSG_ID,
+            "payload": {
+                "result": "applied",
+                "device_state": "idle",
+                "warnings": ["hot", 3],
+                "data": {"bowls": 1}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let actions = m.handle(Command::Packet(device_data(1, &plain)), NOW);
+        let reply = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Reply(reply) => Some(reply),
+                _ => None,
+            })
+            .expect("the frame carries a reply");
+        // Every field of the answer keeps its own name: the result is not the
+        // state of the device, and the data is not the warnings.
+        assert_eq!(
+            reply.outcome,
+            ReplyOutcome::Ack {
+                result: Some("applied".to_string()),
+                device_state: Some("idle".to_string()),
+                warnings: Some(vec!["hot".to_string(), "3".to_string()]),
+                data: Some(r#"{"bowls":1}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_reply_fields_name_the_outcome_and_its_data() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Error {
+                code: Some("E_COMMAND_NOT_ALLOWED".to_string()),
+                severity: Some("error".to_string()),
+                message: Some("Command not allowed on UDP channel".to_string()),
+                retryable: Some(false),
+                details: Some(r#"{"command":"rotate_local_secret"}"#.to_string()),
+            },
+            command: None,
+        };
+        let fields = reply_fields(&reply);
+        assert!(fields.contains(&("code".to_string(), "E_COMMAND_NOT_ALLOWED".to_string())));
+        assert!(fields.contains(&("severity".to_string(), "error".to_string())));
+        assert!(fields.contains(&(
+            "message".to_string(),
+            "Command not allowed on UDP channel".to_string()
+        )));
+        assert!(fields.contains(&("retryable".to_string(), "false".to_string())));
+        assert!(fields.contains(&(
+            "details".to_string(),
+            r#"{"command":"rotate_local_secret"}"#.to_string()
+        )));
+        // The order of the fields is fixed: the journal shows them as the
+        // protocol names them.
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["code", "severity", "message", "retryable", "details"]
+        );
+    }
+
+    /// An answer without fields gives an empty list: the journal shows what
+    /// the device sent, not what it could have sent.
+    #[test]
+    fn the_reply_fields_of_an_answer_without_fields_are_empty() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: None,
+                device_state: None,
+                warnings: Some(Vec::new()),
+                data: None,
+            },
+            command: None,
+        };
+        assert!(reply_fields(&reply).is_empty());
+    }
+
+    /// An empty value stays out: neither an empty string nor an empty list of
+    /// warnings is a field of the answer.
+    #[test]
+    fn an_empty_value_stays_out_of_the_reply_fields() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: Some(String::new()),
+                device_state: Some("idle".to_string()),
+                warnings: Some(Vec::new()),
+                data: None,
+            },
+            command: None,
+        };
+        let fields = reply_fields(&reply);
+        assert_eq!(
+            fields,
+            vec![("device_state".to_string(), "idle".to_string())]
+        );
     }
 }

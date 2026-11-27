@@ -39,6 +39,14 @@ pub fn command_click(ready: bool) -> bool {
     ready
 }
 
+/// Whether the connection names the device the commands go to.
+///
+/// The server refuses a command whose device id is empty (protocol §2.1), so the
+/// client refuses it first.
+pub fn device_id_set(device_id: &str) -> bool {
+    !device_id.trim().is_empty()
+}
+
 /// Text and hex convert into each other. Command has its own field.
 pub fn converts_editor_on_switch(from_mode: &str, to_mode: &str) -> bool {
     from_mode != to_mode && from_mode != "command" && to_mode != "command"
@@ -93,5 +101,13 @@ mod tests {
         assert!(!converts_editor_on_switch("command", "command"));
         assert!(converts_editor_on_switch("text", "hex"));
         assert!(converts_editor_on_switch("hex", "text"));
+    }
+
+    #[test]
+    fn a_device_id_must_not_be_empty() {
+        assert!(device_id_set("dev_00001A2B3C"));
+        assert!(device_id_set("  00001A2B3C4D  "));
+        assert!(!device_id_set(""));
+        assert!(!device_id_set("   "));
     }
 }

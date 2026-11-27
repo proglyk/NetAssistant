@@ -440,6 +440,10 @@ pub const MSG_TYPE_COMMAND: &str = "command";
 pub const MSG_TYPE_ACK: &str = "ack";
 /// Message type of a negative answer (protocol §2.1).
 pub const MSG_TYPE_ERROR: &str = "error";
+/// Message type of a status snapshot of the device (protocol §2.5.4).
+pub const MSG_TYPE_STATUS: &str = "status";
+/// Message type of an event of the device (protocol §2.5.5).
+pub const MSG_TYPE_EVENT: &str = "event";
 
 /// The scope of a command of the application (protocol §2.4.2).
 ///
@@ -465,12 +469,9 @@ pub fn command_envelope(
     object.insert("protocol_version".into(), "1.0".into());
     object.insert("msg_type".into(), MSG_TYPE_COMMAND.into());
     object.insert("msg_id".into(), msg_id.into());
-    // The device id is a setting of the connection. An empty one is left out
-    // of the envelope: the client does not know the id of the device it talks
-    // to until the user writes it down.
-    if !device_id.is_empty() {
-        object.insert("device_id".into(), device_id.into());
-    }
+    // The field is always there: the server refuses a command whose device id
+    // is empty.
+    object.insert("device_id".into(), device_id.into());
     object.insert("ts_utc".into(), ts_utc.into());
     object.insert("seq".into(), seq.into());
     object.insert("source".into(), "app".into());
@@ -491,7 +492,8 @@ pub fn command_envelope(
 ///
 /// The envelope is not a separate packet: it is the plain text of a `DATA`
 /// frame. Only the fields the client needs are read; the unknown fields are
-/// ignored (protocol §2.4.6).
+/// ignored (protocol §2.4.6). The counter `seq` is read as well: the journal
+/// shows it next to the message of the device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
     /// The type of the message: "command", "ack", "error", "status", "event".
@@ -500,6 +502,9 @@ pub struct Envelope {
     pub msg_id: Option<String>,
     /// The identifier of the command the message answers.
     pub correlation_id: Option<String>,
+    /// The counter of the messages of the device in one direction
+    /// (protocol §2.1).
+    pub seq: Option<u64>,
     /// The payload of the message (protocol §2.5).
     pub payload: serde_json::Value,
 }
@@ -524,6 +529,8 @@ impl Envelope {
             .get("correlation_id")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        // The counter is optional and is ignored when it is not a number.
+        let seq = object.get("seq").and_then(|value| value.as_u64());
         let payload = object
             .get("payload")
             .cloned()
@@ -532,6 +539,7 @@ impl Envelope {
             msg_type,
             msg_id,
             correlation_id,
+            seq,
             payload,
         })
     }
@@ -561,9 +569,220 @@ impl Envelope {
         self.payload.get("result").and_then(|value| value.as_str())
     }
 
+    /// The state of the device after the command (§2.5.2).
+    pub fn device_state(&self) -> Option<&str> {
+        self.payload
+            .get("device_state")
+            .and_then(|value| value.as_str())
+    }
+
+    /// The warnings of an answer (§2.5.2).
+    ///
+    /// The field is an array: a string element is kept as it is, every other
+    /// element is the compact JSON of the value, so a warning keeps its shape
+    /// whatever the device sent. A field that is not an array is not a list of
+    /// warnings: the answer carries none of them.
+    pub fn warnings(&self) -> Option<Vec<String>> {
+        let items = self.payload.get("warnings")?.as_array()?;
+        Some(items.iter().map(field_value).collect())
+    }
+
+    /// The product-specific data of an answer (§2.5.2).
+    ///
+    /// The field is free-form: the profile of the device decides what it
+    /// holds, so the value is kept as it is. A null field counts as an absent
+    /// one: the device sends the field it has no data for as null, and the
+    /// journal must not show "null" where there is nothing to show.
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.payload.get("data").filter(|value| !value.is_null())
+    }
+
     /// The code of an error (§2.5.3).
+    ///
+    /// The fields of an error lie in the payload itself (§2.5.3), but an ack
+    /// that was rejected carries them in a nested error object (§2.5.2): both
+    /// shapes are read.
     pub fn error_code(&self) -> Option<&str> {
-        self.payload.get("code").and_then(|value| value.as_str())
+        self.error_field("code").and_then(|value| value.as_str())
+    }
+
+    /// The severity of an error: "info", "warning", "error", "critical"
+    /// (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_severity(&self) -> Option<&str> {
+        self.error_field("severity")
+            .and_then(|value| value.as_str())
+    }
+
+    /// The human-readable text of an error (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_message(&self) -> Option<&str> {
+        self.error_field("message").and_then(|value| value.as_str())
+    }
+
+    /// Whether the command may be repeated (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_retryable(&self) -> Option<bool> {
+        self.error_field("retryable")
+            .and_then(|value| value.as_bool())
+    }
+
+    /// The additional data of an error (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_details(&self) -> Option<&serde_json::Value> {
+        self.error_field("details")
+    }
+
+    /// A field of an error: in the payload itself, or in the nested error
+    /// object of a rejected ack (§2.5.2).
+    ///
+    /// A null field counts as an absent field: the device sends the fields it
+    /// has no value for as null, and such a field must neither shadow the
+    /// nested error object nor reach the journal as a value.
+    fn error_field(&self, name: &str) -> Option<&serde_json::Value> {
+        self.payload
+            .get(name)
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                self.error_object()
+                    .and_then(|error| error.get(name))
+                    .filter(|value| !value.is_null())
+            })
+    }
+
+    /// The nested error object of the payload (§2.5.2).
+    fn error_object(&self) -> Option<&serde_json::Value> {
+        self.payload.get("error").filter(|value| value.is_object())
+    }
+}
+
+/// The kind of a push of the device (protocol §2.5.4, §2.5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushKind {
+    /// A status snapshot of the device.
+    Status,
+    /// An event of the device.
+    Event,
+}
+
+/// A push of the device: a status snapshot or an event (protocol §2.5.4,
+/// §2.5.5).
+///
+/// The body of the push is flattened into `fields`: the name of the key and
+/// the value as text. A nested object is flattened one level, with a dot
+/// between the names (`fw.esp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Push {
+    /// Whether the push is a status snapshot or an event.
+    pub kind: PushKind,
+    /// The identifier of the message.
+    pub msg_id: Option<String>,
+    /// The counter of the envelope (protocol §2.1).
+    pub seq: Option<u64>,
+    /// The body of the push: the name of the key and the value as text.
+    pub fields: Vec<(String, String)>,
+}
+
+/// Parse the open text of a `PUSH` frame (protocol §2.5.4, §2.5.5).
+///
+/// `None` means the text is not a push: the type of the envelope is neither
+/// "status" nor "event", or the body is not an object. Such a text is shown
+/// as it is.
+pub fn parse_push(text: &[u8]) -> Option<Push> {
+    let Envelope {
+        msg_type,
+        msg_id,
+        seq,
+        payload,
+        ..
+    } = Envelope::parse(text)?;
+    let kind = match msg_type.as_str() {
+        MSG_TYPE_STATUS => PushKind::Status,
+        MSG_TYPE_EVENT => PushKind::Event,
+        _ => return None,
+    };
+    // The body of a push is an object (protocol §2.5.4, §2.5.5); a body of
+    // another shape is not a push.
+    let body = payload.as_object()?;
+    Some(Push {
+        kind,
+        msg_id,
+        seq,
+        fields: body_fields(body),
+    })
+}
+
+/// The fields of a push for the journal: the name of the field and the value.
+///
+/// The order follows the envelope (protocol §2.1): the type of the message,
+/// then its identifier and its counter, then the body of the push as the
+/// device sent it. The names are identifiers of the protocol, so the journal
+/// shows them as they are.
+pub fn push_fields(push: &Push) -> Vec<(String, String)> {
+    let mut fields = Vec::with_capacity(push.fields.len() + 3);
+    fields.push((
+        "msg_type".to_string(),
+        match push.kind {
+            PushKind::Status => MSG_TYPE_STATUS.to_string(),
+            PushKind::Event => MSG_TYPE_EVENT.to_string(),
+        },
+    ));
+    if let Some(msg_id) = &push.msg_id {
+        fields.push(("msg_id".to_string(), msg_id.clone()));
+    }
+    if let Some(seq) = push.seq {
+        fields.push(("seq".to_string(), seq.to_string()));
+    }
+    fields.extend(push.fields.iter().cloned());
+    fields
+}
+
+/// The fields of a journal line: `name: value` per line.
+///
+/// The shape is the one of `format_frame_fields`: the journal shows the
+/// fields of a protocol event one per line.
+pub fn format_fields(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The fields of the body of a push: the name of the key and the value.
+///
+/// A nested object is flattened one level: the key of the inner object is
+/// appended to the outer key with a dot (`fw.esp`). A string value is kept as
+/// it is, every other value is the compact JSON of the value.
+fn body_fields(body: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    for (key, value) in body {
+        match value {
+            serde_json::Value::Object(inner) => {
+                for (inner_key, inner_value) in inner {
+                    fields.push((format!("{key}.{inner_key}"), field_value(inner_value)));
+                }
+            }
+            value => fields.push((key.clone(), field_value(value))),
+        }
+    }
+    fields
+}
+
+/// The value of a field as text: a string as it is, every other value as the
+/// compact JSON of the value.
+fn field_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -880,6 +1099,7 @@ mod tests {
         assert!(!envelope.is_command());
         assert_eq!(envelope.msg_id.as_deref(), Some("a-1"));
         assert_eq!(envelope.correlation_id.as_deref(), Some("c-1"));
+        assert_eq!(envelope.seq, Some(2));
         assert_eq!(envelope.result(), Some("applied"));
         assert_eq!(envelope.command_name(), None);
     }
@@ -908,6 +1128,101 @@ mod tests {
         // The answer to a text that is not a command names no command.
         assert_eq!(envelope.msg_id, None);
         assert_eq!(envelope.correlation_id, None);
+    }
+
+    #[test]
+    fn the_error_fields_are_read_from_the_flat_payload() {
+        let text = br#"{"msg_type":"error","payload":{"code":"E_COMMAND_NOT_ALLOWED",
+            "severity":"error","message":"Command not allowed on UDP channel",
+            "retryable":false,"details":{"command":"rotate_local_secret"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_COMMAND_NOT_ALLOWED"));
+        assert_eq!(envelope.error_severity(), Some("error"));
+        assert_eq!(
+            envelope.error_message(),
+            Some("Command not allowed on UDP channel")
+        );
+        assert_eq!(envelope.error_retryable(), Some(false));
+        assert_eq!(
+            envelope
+                .error_details()
+                .and_then(|d| d.get("command"))
+                .and_then(|c| c.as_str()),
+            Some("rotate_local_secret")
+        );
+    }
+
+    #[test]
+    fn the_error_fields_are_read_from_the_nested_error_object() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"rejected",
+            "error":{"code":"E_POWER_LIMIT","severity":"warning",
+            "message":"too hot","retryable":true}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_POWER_LIMIT"));
+        assert_eq!(envelope.error_severity(), Some("warning"));
+        assert_eq!(envelope.error_message(), Some("too hot"));
+        assert_eq!(envelope.error_retryable(), Some(true));
+    }
+
+    #[test]
+    fn the_ack_fields_are_read() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"applied","device_state":"unknown",
+            "warnings":[],"data":{"bowls":1}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.result(), Some("applied"));
+        assert_eq!(envelope.device_state(), Some("unknown"));
+        assert_eq!(envelope.warnings(), Some(vec![]));
+        assert_eq!(
+            envelope
+                .data()
+                .and_then(|d| d.get("bowls"))
+                .and_then(|b| b.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_flat_error_field_wins_over_the_nested_one() {
+        // The payload carries both shapes: the flat field is the answer, the
+        // nested object only fills the fields the payload does not carry.
+        let text = br#"{"msg_type":"error","payload":{"code":"E_FLAT",
+            "error":{"code":"E_NESTED","severity":"warning"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_FLAT"));
+        assert_eq!(envelope.error_severity(), Some("warning"));
+    }
+
+    #[test]
+    fn a_null_field_is_read_as_absent() {
+        // A null field counts as an absent field: it must not shadow the
+        // nested error object and must not reach the journal as a value.
+        let text = br#"{"msg_type":"error","payload":{"code":null,"message":null,
+            "details":null,"data":null,"error":{"code":"E_NESTED"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        // The flat code is null, so the lookup falls through to the nested one.
+        assert_eq!(envelope.error_code(), Some("E_NESTED"));
+        // A null field carries no value.
+        assert_eq!(envelope.error_message(), None);
+        assert_eq!(envelope.error_severity(), None);
+        // The details are absent, not "null".
+        assert_eq!(envelope.error_details(), None);
+        // The data are absent, not "null".
+        assert_eq!(envelope.data(), None);
+    }
+
+    #[test]
+    fn a_warning_that_is_not_a_string_comes_as_compact_json() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"applied",
+            "warnings":["hot",3,{"code":1}]}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(
+            envelope.warnings(),
+            Some(vec![
+                "hot".to_string(),
+                "3".to_string(),
+                r#"{"code":1}"#.to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -1019,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_device_id_is_left_out_of_the_envelope() {
+    fn the_device_id_is_always_in_the_envelope() {
         let bytes = command_envelope(
             "550e8400-e29b-41d4-a716-446655440000",
             "",
@@ -1029,7 +1344,93 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 7);
-        assert!(object.get("device_id").is_none());
+        assert_eq!(object.len(), 8);
+        assert_eq!(object["device_id"], "");
+    }
+
+    #[test]
+    fn a_status_push_is_parsed() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"status","msg_id":"status-3",
+            "device_id":"","ts_utc":"2026-11-27T10:00:00.000Z","seq":12,"source":"device",
+            "payload":{"mcu_connected":true,"wifi_rssi":-59,"fw":{"esp":"1.2.3","proto":"1.0"},
+            "active_errors":[],"ota":null}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        assert_eq!(push.kind, PushKind::Status);
+        assert_eq!(push.msg_id.as_deref(), Some("status-3"));
+        assert_eq!(push.seq, Some(12));
+        assert!(
+            push.fields
+                .contains(&("mcu_connected".to_string(), "true".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("wifi_rssi".to_string(), "-59".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("fw.esp".to_string(), "1.2.3".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("ota".to_string(), "null".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_event_push_is_parsed() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"event","msg_id":"event-7",
+            "device_id":"","ts_utc":"2026-11-27T10:00:01.000Z","seq":13,"source":"device",
+            "payload":{"event_type":"bowl_overflow","bowl_id":"1"}}"#;
+        let push = parse_push(text).expect("the text is an event push");
+        assert_eq!(push.kind, PushKind::Event);
+        assert!(
+            push.fields
+                .contains(&("event_type".to_string(), "bowl_overflow".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_status_without_the_optional_keys_is_parsed() {
+        // The snapshot does not have to carry device_state or fw.mcu.
+        let text = br#"{"msg_type":"status","payload":{"mcu_connected":false}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        assert_eq!(push.fields.len(), 1);
+        assert_eq!(
+            push.fields[0],
+            ("mcu_connected".to_string(), "false".to_string())
+        );
+    }
+
+    #[test]
+    fn a_text_that_is_not_a_push_stays_raw() {
+        // A body that is not an object, an unknown type, a broken JSON.
+        assert!(parse_push(br#"{"msg_type":"ack","payload":{}}"#).is_none());
+        assert!(parse_push(br#"{"msg_type":"status","payload":"text"}"#).is_none());
+        assert!(parse_push(b"not json").is_none());
+    }
+
+    #[test]
+    fn the_push_fields_name_the_message_and_the_body() {
+        let text = br#"{"msg_type":"status","msg_id":"status-3","seq":12,
+            "payload":{"mcu_connected":true,"fw":{"esp":"1.2.3"}}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        let fields = push_fields(&push);
+        assert!(fields.contains(&("msg_type".to_string(), "status".to_string())));
+        assert!(fields.contains(&("msg_id".to_string(), "status-3".to_string())));
+        assert!(fields.contains(&("seq".to_string(), "12".to_string())));
+        assert!(fields.contains(&("mcu_connected".to_string(), "true".to_string())));
+        assert!(fields.contains(&("fw.esp".to_string(), "1.2.3".to_string())));
+    }
+
+    #[test]
+    fn the_fields_are_rendered_one_per_line() {
+        let fields = vec![
+            ("result".to_string(), "applied".to_string()),
+            ("device_state".to_string(), "unknown".to_string()),
+        ];
+        assert_eq!(
+            format_fields(&fields),
+            "result: applied\ndevice_state: unknown"
+        );
     }
 }

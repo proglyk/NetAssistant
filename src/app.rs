@@ -212,7 +212,7 @@ pub struct NetAssistantApp {
     pub udp_session_timeout_input: Entity<InputState>,
     /// HELLO 重试次数
     pub udp_session_retries_input: Entity<InputState>,
-    /// 设备 ID（协议 §2.1 的 `device_id`，写进命令信封；可留空）
+    /// 设备 ID（协议 §2.1 的 `device_id`，写进命令信封；必填，留空时表单不让保存）
     pub udp_session_device_id_input: Entity<InputState>,
 
     // 解码器选择对话框状态(打开时创建, 关闭时置 None)
@@ -421,7 +421,7 @@ impl NetAssistantApp {
         let udp_session_psk_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_timeout_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_retries_input = cx.new(|cx| InputState::new(window, cx));
-        // 设备 ID 可留空：留空时命令信封不写 device_id
+        // 设备 ID：必填——服务端拒收没有设备 ID 的命令，表单在保存时拦截
         let udp_session_device_id_input = cx.new(|cx| InputState::new(window, cx));
         // TLS 证书路径输入（可手动填写，也可由「选择文件」回填）
         let mqtt_tls_ca_input = cx.new(|cx| {
@@ -2602,6 +2602,19 @@ impl NetAssistantApp {
 
         // UDP Session 设置（仅该协议构造；空 PSK 不拦表单，由客户端 connect 拒绝）
         let udp_session_settings = if connection_type == ConnectionType::UdpSession {
+            // 设备 ID 必填：协议 §2.1 里服务端拒收没有 device_id 的命令，表单先拦
+            let device_id = self
+                .udp_session_device_id_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            if !crate::session_udp::send::device_id_set(&device_id) {
+                self.connection_form_error =
+                    Some(t!("new_connection.error_udp_session_device_id_required").to_string());
+                cx.notify();
+                return false;
+            }
             // PSK 不做 trim：空白也可能是合法密钥的一部分
             let psk = self.udp_session_psk_input.read(cx).value().to_string();
             let timeout_str = self
@@ -2646,12 +2659,7 @@ impl NetAssistantApp {
                 psk,
                 handshake_timeout_ms,
                 hello_retries,
-                device_id: self
-                    .udp_session_device_id_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string(),
+                device_id,
             })
         } else {
             None

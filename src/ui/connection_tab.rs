@@ -477,6 +477,19 @@ impl ConnectionTabState {
         }
     }
 
+    /// The device id of the connection: the name of the device the commands
+    /// go to. Empty when the connection is not a UDP Session one.
+    pub fn session_device_id(&self) -> &str {
+        match &self.connection_config {
+            ConnectionConfig::Client(config) => config
+                .udp_session
+                .as_ref()
+                .map(|settings| settings.device_id.as_str())
+                .unwrap_or(""),
+            ConnectionConfig::Server(_) => "",
+        }
+    }
+
     pub fn add_message(&mut self, message: Message) {
         // 日志记录：异步写入文件
         if self.log_enabled {
@@ -3865,24 +3878,42 @@ impl<'a> ConnectionTab<'a> {
     /// field carries whatever the user typed and goes out by the Send button.
     fn render_command_row(&self, theme: &Theme, cx: &mut Context<NetAssistantApp>) -> Div {
         let tab_id = self.tab_id.clone();
+        // 协议 §2.1: 命令信封必须带 device_id，否则服务端拒收——缺了就当场提示
+        let device_id_missing = self.tab_state.connection_config.protocol()
+            == ConnectionType::UdpSession
+            && !crate::session_udp::send::device_id_set(self.tab_state.session_device_id());
         div()
             .flex()
-            .items_center()
-            .gap_2()
-            .child(self.render_command_button(theme, &tab_id, "get_status", cx))
-            .child(self.render_command_button(theme, &tab_id, "get_capabilities", cx))
+            .flex_col()
+            .gap_1()
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("connection_tab.command_name_label").to_string()),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_command_button(theme, &tab_id, "get_status", cx))
+                    .child(self.render_command_button(theme, &tab_id, "get_capabilities", cx))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("connection_tab.command_name_label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.tab_state.command_name_input)),
+                    ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.tab_state.command_name_input)),
-            )
+            .when(device_id_missing, |div_builder| {
+                div_builder.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("connection_tab.command_device_id_missing").to_string()),
+                )
+            })
     }
 
     /// One named command button.
@@ -4057,6 +4088,8 @@ fn stage_color(stage: MessageStage) -> Rgba {
         MessageStage::Session => gpui_kit::rgb(0x4ade80),
         MessageStage::Handshake => gpui_kit::rgb(0xfacc15),
         MessageStage::Sender => gpui_kit::rgb(0xa78bfa),
+        MessageStage::Push => gpui_kit::rgb(0x38bdf8),
+        MessageStage::Reply => gpui_kit::rgb(0xfb923c),
     }
 }
 

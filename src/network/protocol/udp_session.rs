@@ -19,10 +19,11 @@ use crate::network::events::{ConnectionEvent, NetCounters, WireMessage};
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
 use crate::session_udp::codec::{
-    Frame, HANDSHAKE_NONCE_LEN, PacketType, encode, format_frame_fields,
+    Frame, HANDSHAKE_NONCE_LEN, PacketType, PushKind, encode, format_fields, format_frame_fields,
+    push_fields,
 };
 use crate::session_udp::machine::{
-    Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome, Trace,
+    Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome, Trace, reply_fields,
 };
 use log::{debug, error, info, warn};
 use rust_i18n::t;
@@ -100,6 +101,7 @@ fn fail_text(token: &str) -> String {
 fn warn_text(token: &str) -> String {
     match token {
         "not established" => t!("udp_session.warn_not_established").to_string(),
+        "device id is not set" => t!("udp_session.warn_device_id").to_string(),
         "foreign session" => t!("udp_session.warn_foreign_session").to_string(),
         "bad nonce" => t!("udp_session.warn_bad_nonce").to_string(),
         "timestamp out of window" => t!("udp_session.warn_timestamp_out_of_window").to_string(),
@@ -155,6 +157,20 @@ fn trace_lines(trace: &Trace) -> Vec<(MessageStage, MessageDirection, String)> {
             MessageDirection::Received,
             t!("udp_session.trace_open_session").to_string(),
         ),
+        Trace::Push { push } => {
+            // The prose names the kind of the push; the names below it are
+            // identifiers of the protocol, so they stay as they are.
+            let prose = match push.kind {
+                PushKind::Status => t!("udp_session.trace_push_status").to_string(),
+                PushKind::Event => t!("udp_session.trace_push_event").to_string(),
+            };
+            let fields = format_fields(&push_fields(push));
+            (
+                MessageStage::Push,
+                MessageDirection::Received,
+                format!("{prose}\n{fields}"),
+            )
+        }
     };
     vec![line]
 }
@@ -213,31 +229,72 @@ fn close_reason_text(reason: &str) -> String {
 ///
 /// The plain text of the answer stays in the message list: this text is the
 /// short summary next to it.
+///
+/// The state of the device and the text of the error say more than a result
+/// and a code, so they win when the device sent them; the command label is
+/// left out then, because the new wordings have no room for it.
 fn reply_text(reply: &CommandReply) -> String {
     let command = reply.command.as_ref().map(command_label);
-    match (&reply.outcome, command) {
-        (ReplyOutcome::Ack { result }, Some(command)) => t!(
-            "udp_session.reply_ack_command",
-            command = command.as_str(),
-            result = result.as_deref().unwrap_or(EMPTY_VALUE)
-        )
-        .to_string(),
-        (ReplyOutcome::Ack { result }, None) => t!(
-            "udp_session.reply_ack",
-            result = result.as_deref().unwrap_or(EMPTY_VALUE)
-        )
-        .to_string(),
-        (ReplyOutcome::Error { code }, Some(command)) => t!(
-            "udp_session.reply_error_command",
-            command = command.as_str(),
-            code = code.as_deref().unwrap_or(EMPTY_VALUE)
-        )
-        .to_string(),
-        (ReplyOutcome::Error { code }, None) => t!(
-            "udp_session.reply_error",
-            code = code.as_deref().unwrap_or(EMPTY_VALUE)
-        )
-        .to_string(),
+    match &reply.outcome {
+        ReplyOutcome::Ack {
+            result,
+            device_state,
+            ..
+        } => {
+            let result_text = result.as_deref().unwrap_or(EMPTY_VALUE);
+            match (device_state, &command) {
+                (Some(state), _) => t!(
+                    "udp_session.reply_ack_state",
+                    result = result_text,
+                    state = state.as_str()
+                )
+                .to_string(),
+                (None, Some(command)) => t!(
+                    "udp_session.reply_ack_command",
+                    command = command.as_str(),
+                    result = result_text
+                )
+                .to_string(),
+                (None, None) => t!("udp_session.reply_ack", result = result_text).to_string(),
+            }
+        }
+        ReplyOutcome::Error { code, message, .. } => {
+            let code_text = code.as_deref().unwrap_or(EMPTY_VALUE);
+            match (message, &command) {
+                (Some(message), _) => t!(
+                    "udp_session.reply_error_message",
+                    code = code_text,
+                    message = message.as_str()
+                )
+                .to_string(),
+                (None, Some(command)) => t!(
+                    "udp_session.reply_error_command",
+                    command = command.as_str(),
+                    code = code_text
+                )
+                .to_string(),
+                (None, None) => t!("udp_session.reply_error", code = code_text).to_string(),
+            }
+        }
+    }
+}
+
+/// The journal line of an answer (protocol §2.5.2, §2.5.3).
+///
+/// The prose names the outcome and is translated; the fields below it are
+/// identifiers of the protocol, so they stay as they are.
+fn reply_line(reply: &CommandReply) -> String {
+    let prose = match &reply.outcome {
+        ReplyOutcome::Ack { .. } => t!("udp_session.trace_reply_ack").to_string(),
+        ReplyOutcome::Error { .. } => t!("udp_session.trace_reply_error").to_string(),
+    };
+    let fields = format_fields(&reply_fields(reply));
+    // An answer without fields leaves only the prose: a row that ended with a
+    // newline would show an empty line under it.
+    if fields.is_empty() {
+        prose
+    } else {
+        format!("{prose}\n{fields}")
     }
 }
 
@@ -672,9 +729,20 @@ async fn apply(
                 }
             }
             Action::Reply(reply) => {
-                // The plain text of the answer is already in the message list:
-                // this is the short summary next to it. A confirmation is a
-                // transient hint, a refusal stays as a warning.
+                // The answer has its own line in the journal: the plain text
+                // of the frame is already in the message list, and this line
+                // names the outcome and the fields of the answer.
+                send_trace(
+                    event_sender,
+                    id,
+                    MessageDirection::Received,
+                    MessageStage::Reply,
+                    reply_line(&reply),
+                )
+                .await;
+                // The hint next to it: the short summary of the answer. A
+                // confirmation is a transient hint, a refusal stays as a
+                // warning.
                 if let Some(sender) = event_sender {
                     let text = reply_text(&reply);
                     let event = if matches!(reply.outcome, ReplyOutcome::Ack { .. }) {
@@ -742,7 +810,7 @@ mod tests {
     use crate::reply::model::{ReplyPayload, ReplyRule, ReplyRulesConfig};
     use crate::session_udp::codec::{
         Body, DIRECTION_ESP_TO_APP, Frame, HKDF_INFO, Header, MAX_DATAGRAM, build_nonce, decode,
-        header_bytes, proof_a_input, proof_b_input,
+        header_bytes, parse_push, proof_a_input, proof_b_input,
     };
     use crate::session_udp::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256};
     use smol::channel::Receiver;
@@ -1711,6 +1779,129 @@ mod tests {
         assert!(!text.contains("payload:"));
         assert!(!text.contains("secret-body"));
         assert!(!text.contains("abababab"));
+    }
+
+    /// The push line: the stage of the push, the prose of its kind and the
+    /// fields of the snapshot.
+    #[test]
+    fn a_push_line_has_the_prose_and_the_fields() {
+        let push = parse_push(
+            br#"{"msg_type":"status","msg_id":"status-7","seq":12,
+                "payload":{"mcu_connected":true}}"#,
+        )
+        .expect("the text is a status push");
+        let lines = trace_lines(&Trace::Push { push });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, MessageStage::Push);
+        assert_eq!(lines[0].1, MessageDirection::Received);
+        let text = &lines[0].2;
+        // The prose names the kind of the push; the fields below it are the
+        // identifiers of the protocol.
+        assert!(text.starts_with(t!("udp_session.trace_push_status").as_ref()));
+        assert!(text.contains("msg_type: status"));
+        assert!(text.contains("msg_id: status-7"));
+        assert!(text.contains("seq: 12"));
+        assert!(text.contains("mcu_connected: true"));
+    }
+
+    /// The push line of an event: the prose of the other kind.
+    #[test]
+    fn an_event_push_line_names_the_event() {
+        let push = parse_push(
+            br#"{"msg_type":"event","msg_id":"event-1",
+                "payload":{"event_type":"bowl_overflow"}}"#,
+        )
+        .expect("the text is an event push");
+        let lines = trace_lines(&Trace::Push { push });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, MessageStage::Push);
+        let text = &lines[0].2;
+        assert!(text.starts_with(t!("udp_session.trace_push_event").as_ref()));
+        assert!(text.contains("msg_type: event"));
+        assert!(text.contains("event_type: bowl_overflow"));
+    }
+
+    /// The line of an answer: the prose names the outcome, the fields below
+    /// it are the identifiers of the protocol.
+    #[test]
+    fn a_reply_line_names_the_outcome_and_its_fields() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: Some("applied".to_string()),
+                device_state: Some("idle".to_string()),
+                warnings: Some(vec!["hot".to_string(), "3".to_string()]),
+                data: Some(r#"{"bowls":1}"#.to_string()),
+            },
+            command: None,
+        };
+        let text = reply_line(&reply);
+        assert!(text.starts_with(t!("udp_session.trace_reply_ack").as_ref()));
+        assert!(text.contains("result: applied"));
+        assert!(text.contains("device_state: idle"));
+        // The warnings are a list: as a JSON array the elements stay apart.
+        assert!(text.contains(r#"warnings: ["hot","3"]"#));
+        assert!(text.contains(r#"data: {"bowls":1}"#));
+        // The order of the fields is fixed: the protocol names them so.
+        let names: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(": ").map(|(name, _)| name))
+            .collect();
+        assert_eq!(names, ["result", "device_state", "warnings", "data"]);
+    }
+
+    /// The hint of a refusal carries the text of the error, not only its code.
+    #[test]
+    fn the_reply_hint_carries_the_text_of_the_error() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Error {
+                code: Some("E_COMMAND_NOT_ALLOWED".to_string()),
+                severity: Some("error".to_string()),
+                message: Some("Command not allowed on UDP channel".to_string()),
+                retryable: Some(false),
+                details: None,
+            },
+            command: None,
+        };
+        let text = reply_text(&reply);
+        assert!(text.contains("E_COMMAND_NOT_ALLOWED"));
+        assert!(text.contains("Command not allowed on UDP channel"));
+    }
+
+    /// The hint of a confirmation carries the result and the state of the
+    /// device. The wording is translated, so the test asserts the values.
+    #[test]
+    fn the_reply_hint_carries_the_result_and_the_state() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: Some("applied".to_string()),
+                device_state: Some("idle".to_string()),
+                warnings: None,
+                data: None,
+            },
+            command: None,
+        };
+        let text = reply_text(&reply);
+        assert!(text.contains("applied"));
+        assert!(text.contains("idle"));
+    }
+
+    /// An answer without fields leaves a row of the prose alone: no empty
+    /// line under it.
+    #[test]
+    fn a_reply_line_without_fields_is_the_prose_alone() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: None,
+                device_state: None,
+                warnings: None,
+                data: None,
+            },
+            command: None,
+        };
+        let text = reply_line(&reply);
+        assert_eq!(text, t!("udp_session.trace_reply_ack").to_string());
+        assert!(!text.ends_with('\n'));
     }
 
     #[tokio::test]

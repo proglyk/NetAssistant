@@ -28,6 +28,12 @@ impl fmt::Display for MessageDirection {
 /// 阶段对应 `docs-dev/pictures/udp-path.png` 里的环节：socket → decoder →
 /// session → handshake → sender。阶段名与颜色在 UI 层渲染，消息本身只带标签，
 /// 不带颜色，避免核心层依赖 gpui。
+///
+/// `Push` 不在这条路径上：它是设备主动推送的报文（状态快照或事件），单独
+/// 一行，免得和 `DATA` 的回应混在一起。
+///
+/// `Reply` 同样单独一行：它是设备对一条命令的回应，免得和推送、和 `DATA`
+/// 的解码行混在一起。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageStage {
@@ -41,6 +47,10 @@ pub enum MessageStage {
     Handshake,
     /// udp:sender：发送
     Sender,
+    /// udp:push：设备推送的状态快照或事件
+    Push,
+    /// udp:reply：设备对命令的回应
+    Reply,
 }
 
 impl MessageStage {
@@ -52,6 +62,8 @@ impl MessageStage {
             MessageStage::Session => "udp:session",
             MessageStage::Handshake => "udp:handshake",
             MessageStage::Sender => "udp:sender",
+            MessageStage::Push => "udp:push",
+            MessageStage::Reply => "udp:reply",
         }
     }
 }
