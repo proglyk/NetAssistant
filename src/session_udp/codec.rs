@@ -465,12 +465,9 @@ pub fn command_envelope(
     object.insert("protocol_version".into(), "1.0".into());
     object.insert("msg_type".into(), MSG_TYPE_COMMAND.into());
     object.insert("msg_id".into(), msg_id.into());
-    // The device id is a setting of the connection. An empty one is left out
-    // of the envelope: the client does not know the id of the device it talks
-    // to until the user writes it down.
-    if !device_id.is_empty() {
-        object.insert("device_id".into(), device_id.into());
-    }
+    // The field is always there: the server refuses a command whose device id
+    // is empty.
+    object.insert("device_id".into(), device_id.into());
     object.insert("ts_utc".into(), ts_utc.into());
     object.insert("seq".into(), seq.into());
     object.insert("source".into(), "app".into());
@@ -1019,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_device_id_is_left_out_of_the_envelope() {
+    fn the_device_id_is_always_in_the_envelope() {
         let bytes = command_envelope(
             "550e8400-e29b-41d4-a716-446655440000",
             "",
@@ -1029,7 +1026,7 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 7);
-        assert!(object.get("device_id").is_none());
+        assert_eq!(object.len(), 8);
+        assert_eq!(object["device_id"], "");
     }
 }

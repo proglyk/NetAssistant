@@ -100,6 +100,7 @@ fn fail_text(token: &str) -> String {
 fn warn_text(token: &str) -> String {
     match token {
         "not established" => t!("udp_session.warn_not_established").to_string(),
+        "device id is not set" => t!("udp_session.warn_device_id").to_string(),
         "foreign session" => t!("udp_session.warn_foreign_session").to_string(),
         "bad nonce" => t!("udp_session.warn_bad_nonce").to_string(),
         "timestamp out of window" => t!("udp_session.warn_timestamp_out_of_window").to_string(),

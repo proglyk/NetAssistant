@@ -411,7 +411,7 @@ pub struct UdpSessionSettings {
     #[serde(default = "default_hello_retries")]
     pub hello_retries: u8,
     /// 设备 ID（协议 §2.1 的 `device_id`）：写进命令信封的顶层字段。
-    /// 空串表示未知：此时该字段不写进信封。
+    /// 空串表示未知：此时命令不发出去——服务端拒收没有设备 ID 的命令。
     #[serde(default)]
     pub device_id: String,
 }
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(settings.psk, "s");
         assert_eq!(settings.handshake_timeout_ms, 1000);
         assert_eq!(settings.hello_retries, 3);
-        // 旧配置里没有设备 ID：命令信封不写这个字段
+        // 旧配置里没有设备 ID：这种连接发不出命令
         assert_eq!(settings.device_id, "");
     }
 

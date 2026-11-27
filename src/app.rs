@@ -212,7 +212,7 @@ pub struct NetAssistantApp {
     pub udp_session_timeout_input: Entity<InputState>,
     /// HELLO 重试次数
     pub udp_session_retries_input: Entity<InputState>,
-    /// 设备 ID（协议 §2.1 的 `device_id`，写进命令信封；可留空）
+    /// 设备 ID（协议 §2.1 的 `device_id`，写进命令信封；留空时命令发不出去）
     pub udp_session_device_id_input: Entity<InputState>,
 
     // 解码器选择对话框状态(打开时创建, 关闭时置 None)
@@ -421,7 +421,7 @@ impl NetAssistantApp {
         let udp_session_psk_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_timeout_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_retries_input = cx.new(|cx| InputState::new(window, cx));
-        // 设备 ID 可留空：留空时命令信封不写 device_id
+        // 设备 ID：留空时命令发不出去——服务端拒收没有设备 ID 的命令
         let udp_session_device_id_input = cx.new(|cx| InputState::new(window, cx));
         // TLS 证书路径输入（可手动填写，也可由「选择文件」回填）
         let mqtt_tls_ca_input = cx.new(|cx| {

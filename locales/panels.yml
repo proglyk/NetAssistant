@@ -975,6 +975,9 @@ udp_session:
   warn_not_established:
     zh-CN: 会话尚未建立，未发送
     en: Session is not up; nothing sent
+  warn_device_id:
+    zh-CN: 未设置设备 ID，命令未发送
+    en: Device ID is not set; the command was not sent
   warn_foreign_session:
     zh-CN: 收到其他会话的报文
     en: Packet from another session

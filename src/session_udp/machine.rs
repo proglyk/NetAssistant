@@ -70,7 +70,7 @@ pub enum Command {
         /// the machine, which has no random source of its own.
         msg_id: String,
         /// The identifier of the device the command goes to (protocol §2.1).
-        /// An empty one is left out of the envelope.
+        /// An empty one stops the command: the server refuses it.
         device_id: String,
     },
     /// The user disconnected.
@@ -694,7 +694,10 @@ impl Machine {
     /// sends it as the body of a `DATA` frame.
     ///
     /// The name is trimmed and an empty one is refused before any datagram:
-    /// the counter of the session grows only for an accepted command.
+    /// the counter of the session grows only for an accepted command. The
+    /// device id is trimmed as well: an empty one is refused, because the
+    /// server would answer `E_INVALID_CMD` and the command would never get
+    /// an answer.
     fn on_send_command(
         &mut self,
         cmd: String,
@@ -709,11 +712,17 @@ impl Machine {
         if !matches!(self.state, State::Established { .. }) {
             return vec![Action::Warn("not established".to_string())];
         }
+        // The device id is a setting of the connection. Without it the server
+        // does not accept the command, so the frame must not leave the client.
+        let device_id = device_id.trim();
+        if device_id.is_empty() {
+            return vec![Action::Warn("device id is not set".to_string())];
+        }
         let seq = match &self.state {
             State::Established { json_seq, .. } => *json_seq,
             _ => return Vec::new(),
         };
-        let body = command_envelope(&msg_id, &device_id, &format_ts_utc(now), seq, &name);
+        let body = command_envelope(&msg_id, device_id, &format_ts_utc(now), seq, &name);
         let actions = self.on_user_bytes(body, nonce_tail, now);
         let sent = actions
             .iter()
@@ -1912,11 +1921,17 @@ mod tests {
 
     /// A command of the user with the identity of the message.
     fn send_command(cmd: &str) -> Command {
+        send_command_for(cmd, DEVICE_ID)
+    }
+
+    /// A command of the user with the identity of the message and the device
+    /// of the given id.
+    fn send_command_for(cmd: &str, device_id: &str) -> Command {
         Command::SendCommand {
             cmd: cmd.to_string(),
             nonce_tail: tail(),
             msg_id: MSG_ID.to_string(),
-            device_id: DEVICE_ID.to_string(),
+            device_id: device_id.to_string(),
         }
     }
 
@@ -1938,6 +1953,28 @@ mod tests {
         let text = format_frame_fields(sent(&actions), Some(&plain_of(&actions)));
         assert!(text.contains("payload: "));
         assert!(text.contains("get_status"));
+    }
+
+    #[test]
+    fn a_command_without_a_device_id_is_not_sent() {
+        for device_id in ["", "   "] {
+            let mut m = Machine::new();
+            establish(&mut m);
+            let actions = m.handle(send_command_for("get_status", device_id), NOW);
+            assert!(
+                matches!(&actions[..], [Action::Warn(text)] if text == "device id is not set"),
+                "the command must not leave the client: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_device_id_is_trimmed_in_the_envelope() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let actions = m.handle(send_command_for("get_status", "  dev_00001A2B3C  "), NOW);
+        let value = envelope_of(&actions);
+        assert_eq!(value["device_id"], DEVICE_ID);
     }
 
     #[test]
