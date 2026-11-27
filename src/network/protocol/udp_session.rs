@@ -479,7 +479,12 @@ impl NetworkConnection for UdpSessionClient {
                                     // The user bytes enter the state machine as they are: no trailer is appended, the
                                                                         // finalized flag is not read. A marked wire is a command name.
                                     let actions = machine.handle(
-                                        command_for_wire(wire.is_session_command(), wire.data(), tail),
+                                        command_for_wire(
+                                            wire.is_session_command(),
+                                            wire.data(),
+                                            tail,
+                                            &settings.device_id,
+                                        ),
                                         unix_now(),
                                     );
                                     let flow = apply(&actions, &socket, &event_sender_loop, &id, &net_counters_loop).await;
@@ -535,10 +540,23 @@ enum Flow {
 
 /// The command of a wire message: a marked wire carries a command name for
 /// the state machine, a plain wire carries the editor bytes.
-fn command_for_wire(session_command: bool, bytes: &[u8], nonce_tail: [u8; 5]) -> Command {
+///
+/// The identifier of the message is a UUID (protocol §2.1). It is made here
+/// and not in the state machine: the machine has no random source of its own.
+fn command_for_wire(
+    session_command: bool,
+    bytes: &[u8],
+    nonce_tail: [u8; 5],
+    device_id: &str,
+) -> Command {
     if session_command {
         let cmd = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-        Command::SendCommand { cmd, nonce_tail }
+        Command::SendCommand {
+            cmd,
+            nonce_tail,
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            device_id: device_id.to_string(),
+        }
     } else {
         Command::UserBytes {
             bytes: bytes.to_vec(),
@@ -1443,13 +1461,13 @@ mod tests {
     }
 
     /// The command envelope of the user: the client sends it as it is.
-    const COMMAND: &[u8] = br#"{"protocol_version":"1.0","msg_type":"command","msg_id":"cmd-1","ts_utc":"2026-11-17T18:00:00.000Z","seq":1,"source":"app","payload":{"cmd":"get_status","scope":"device","ttl_sec":30,"params":{}}}"#;
+    const COMMAND: &[u8] = br#"{"protocol_version":"1.0","msg_type":"command","msg_id":"550e8400-e29b-41d4-a716-446655440000","device_id":"dev_00001A2B3C","ts_utc":"2026-11-17T18:00:00.000Z","seq":1,"source":"app","payload":{"cmd":"get_status","scope":"device","ttl_sec":30,"params":{}}}"#;
 
     /// The refusal of the device: the answer to a text that is not a command.
     const ERROR: &[u8] = br#"{"protocol_version":"1.0","msg_type":"error","device_id":"","ts_utc":"1970-01-01T00:00:00.000Z","seq":1,"source":"device","payload":{"code":"E_INVALID_CMD","severity":"error","message":"The command is not a valid message","retryable":false}}"#;
 
     /// The confirmation of the device: the answer that names the command.
-    const ACK: &[u8] = br#"{"protocol_version":"1.0","msg_type":"ack","correlation_id":"cmd-1","device_id":"dev_1","ts_utc":"2026-11-17T18:00:01.000Z","seq":1,"source":"device","payload":{"result":"applied","device_state":"idle"}}"#;
+    const ACK: &[u8] = br#"{"protocol_version":"1.0","msg_type":"ack","correlation_id":"550e8400-e29b-41d4-a716-446655440000","device_id":"dev_1","ts_utc":"2026-11-17T18:00:01.000Z","seq":1,"source":"device","payload":{"result":"applied","device_state":"idle"}}"#;
 
     #[tokio::test]
     async fn loopback_device_error_is_shown_as_a_warning() {
@@ -1558,7 +1576,7 @@ mod tests {
                 event,
                 ConnectionEvent::MessageReceived(_, message)
                     if message.stage == Some(MessageStage::Decoder)
-                        && message.get_content_by_type().contains("cmd-1")
+                        && message.get_content_by_type().contains("550e8400")
             )
         })
         .await;
@@ -1579,7 +1597,7 @@ mod tests {
         let (ev, _) = wait_for(&rx, |e| matches!(e, ConnectionEvent::StatusHint(..))).await;
         match ev {
             ConnectionEvent::StatusHint(_, text) => {
-                let command = "get_status (cmd-1)";
+                let command = "get_status (550e8400-e29b-41d4-a716-446655440000)";
                 let result = "applied";
                 assert_eq!(
                     text,
@@ -1593,6 +1611,59 @@ mod tests {
             }
             other => panic!("expected StatusHint, got {other:?}"),
         }
+    }
+
+    /// The command of the client goes on the wire with the fields of the
+    /// protocol (protocol §2.1, §2.5.1).
+    #[tokio::test]
+    async fn a_command_of_the_client_carries_the_fields_of_the_protocol() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = smol_unbounded::<ConnectionEvent>();
+        let mut client = UdpSessionClient::new(
+            client_config(peer_addr.port()),
+            Some(tx),
+            None,
+            TrailerSetting::default(),
+            rules_store(),
+        );
+        client.connect().await.unwrap();
+        let (nonce_a, _client_addr, write_tx) = establish(&peer, &rx).await;
+
+        // The Command chip sends a name: the client builds the envelope.
+        write_tx
+            .send(WireMessage::session_command(b"get_status".to_vec()))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = decode(&buf[..n]).unwrap();
+        let Body::Encrypted { nonce, ciphertext } = &frame.body else {
+            panic!("expected an encrypted body")
+        };
+        let plain = aes_gcm_decrypt(
+            &session_key(nonce_a),
+            nonce,
+            &header_bytes(&frame.header),
+            ciphertext,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(value["protocol_version"], "1.0");
+        assert_eq!(value["msg_type"], "command");
+        assert_eq!(value["device_id"], DEVICE_ID);
+        assert_eq!(value["source"], "app");
+        assert_eq!(value["seq"], serde_json::json!(1));
+        assert_eq!(value["payload"]["cmd"], "get_status");
+        assert_eq!(value["payload"]["scope"], "device");
+        assert_eq!(value["payload"]["ttl_sec"], serde_json::json!(30));
+        assert_eq!(value["payload"]["params"], serde_json::json!({}));
+        // The identifier is a UUID (protocol §2.1).
+        let msg_id = value["msg_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(msg_id).is_ok(), "{msg_id}");
     }
 
     /// The session log lines: the messages that carry a stage.
@@ -1796,14 +1867,22 @@ mod tests {
     #[test]
     fn a_marked_wire_is_a_send_command_and_a_plain_wire_is_user_bytes() {
         let tail = [1u8, 2, 3, 4, 5];
-        match command_for_wire(true, b"get_status", tail) {
-            Command::SendCommand { cmd, nonce_tail } => {
+        match command_for_wire(true, b"get_status", tail, "dev_00001A2B3C") {
+            Command::SendCommand {
+                cmd,
+                nonce_tail,
+                msg_id,
+                device_id,
+            } => {
                 assert_eq!(cmd, "get_status");
                 assert_eq!(nonce_tail, tail);
+                assert_eq!(device_id, "dev_00001A2B3C");
+                // The identifier is a UUID (protocol §2.1).
+                assert!(uuid::Uuid::parse_str(&msg_id).is_ok(), "{msg_id}");
             }
             other => panic!("expected SendCommand, got {other:?}"),
         }
-        match command_for_wire(false, b"{\"a\":1}", tail) {
+        match command_for_wire(false, b"{\"a\":1}", tail, "") {
             Command::UserBytes { bytes, .. } => assert_eq!(bytes, b"{\"a\":1}"),
             other => panic!("expected UserBytes, got {other:?}"),
         }
