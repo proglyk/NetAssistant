@@ -219,8 +219,14 @@ new_connection:
     zh-CN: HELLO 重试次数
     en: HELLO retries
   udp_session_device_id_label:
-    zh-CN: 设备 ID（写入命令，可留空）
-    en: Device ID (written into commands, optional)
+    zh-CN: 设备 ID
+    en: Device ID
+  udp_session_device_id_hint:
+    zh-CN: 主板基础 MAC 的 12 位小写十六进制，不带 dev_ 前缀
+    en: "12 lowercase hex digits of the board's base MAC, without the dev_ prefix"
+  error_udp_session_device_id_required:
+    zh-CN: 请填写设备 ID：服务器不接受没有设备 ID 的命令
+    en: "Fill in the device ID: the server refuses commands without it"
   error_bad_protocol:
     zh-CN: 未知协议
     en: Unknown protocol

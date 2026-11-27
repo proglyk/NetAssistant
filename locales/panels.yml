@@ -545,6 +545,9 @@ connection_tab:
   command_name_label:
     zh-CN: 命令名
     en: Command name
+  command_device_id_missing:
+    zh-CN: 未设置设备 ID：命令不会发出，请在连接设置中填写
+    en: "Device ID is not set: commands will not be sent; fill it in the connection settings"
   auto_reply:
     zh-CN: 自动回复
     en: Auto Reply

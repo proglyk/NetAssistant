@@ -499,10 +499,11 @@ fn render_mqtt_base_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &Ap
         )
 }
 
-/// 渲染 UDP Session 基础区（预共享密钥 / 握手超时 / HELLO 重试）
+/// 渲染 UDP Session 基础区（预共享密钥 / 握手超时 / HELLO 重试 / 设备 ID）
 ///
 /// 预共享密钥用普通输入框（项目里没有单独的掩码组件，和 MQTT 密码同域）：
 /// 密钥本身不进日志、不进状态提示、不进错误文本。
+/// 设备 ID 必填（协议 §2.1）：字段下给出取法提示，表单在保存时校验。
 fn render_udp_session_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &App) -> Div {
     let state = app.read(cx);
     div()
@@ -551,7 +552,13 @@ fn render_udp_session_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &
                     theme,
                     t!("new_connection.udp_session_device_id_label").to_string(),
                 ))
-                .child(Input::new(&state.udp_session_device_id_input).cleanable(true)),
+                .child(Input::new(&state.udp_session_device_id_input).cleanable(true))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("new_connection.udp_session_device_id_hint").to_string()),
+                ),
         )
 }
 
