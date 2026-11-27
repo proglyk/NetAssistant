@@ -440,6 +440,15 @@ pub const MSG_TYPE_COMMAND: &str = "command";
 pub const MSG_TYPE_ACK: &str = "ack";
 /// Message type of a negative answer (protocol §2.1).
 pub const MSG_TYPE_ERROR: &str = "error";
+// The push API (`MSG_TYPE_STATUS`, `MSG_TYPE_EVENT`, `PushKind`, `Push` and
+// `parse_push`) is introduced as one cluster and is read by the journal layer
+// that follows it; until then the unused-item lint is muted on each item.
+/// Message type of a status snapshot of the device (protocol §2.5.4).
+#[allow(dead_code)]
+pub const MSG_TYPE_STATUS: &str = "status";
+/// Message type of an event of the device (protocol §2.5.5).
+#[allow(dead_code)]
+pub const MSG_TYPE_EVENT: &str = "event";
 
 /// The scope of a command of the application (protocol §2.4.2).
 ///
@@ -488,7 +497,8 @@ pub fn command_envelope(
 ///
 /// The envelope is not a separate packet: it is the plain text of a `DATA`
 /// frame. Only the fields the client needs are read; the unknown fields are
-/// ignored (protocol §2.4.6).
+/// ignored (protocol §2.4.6). The counter `seq` is read as well: the journal
+/// shows it next to the message of the device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
     /// The type of the message: "command", "ack", "error", "status", "event".
@@ -497,6 +507,9 @@ pub struct Envelope {
     pub msg_id: Option<String>,
     /// The identifier of the command the message answers.
     pub correlation_id: Option<String>,
+    /// The counter of the messages of the device in one direction
+    /// (protocol §2.1).
+    pub seq: Option<u64>,
     /// The payload of the message (protocol §2.5).
     pub payload: serde_json::Value,
 }
@@ -521,6 +534,8 @@ impl Envelope {
             .get("correlation_id")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        // The counter is optional and is ignored when it is not a number.
+        let seq = object.get("seq").and_then(|value| value.as_u64());
         let payload = object
             .get("payload")
             .cloned()
@@ -529,6 +544,7 @@ impl Envelope {
             msg_type,
             msg_id,
             correlation_id,
+            seq,
             payload,
         })
     }
@@ -561,6 +577,94 @@ impl Envelope {
     /// The code of an error (§2.5.3).
     pub fn error_code(&self) -> Option<&str> {
         self.payload.get("code").and_then(|value| value.as_str())
+    }
+}
+
+/// The kind of a push of the device (protocol §2.5.4, §2.5.5).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushKind {
+    /// A status snapshot of the device.
+    Status,
+    /// An event of the device.
+    Event,
+}
+
+/// A push of the device: a status snapshot or an event (protocol §2.5.4,
+/// §2.5.5).
+///
+/// The body of the push is flattened into `fields`: the name of the key and
+/// the value as text. A nested object is flattened one level, with a dot
+/// between the names (`fw.esp`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Push {
+    /// Whether the push is a status snapshot or an event.
+    pub kind: PushKind,
+    /// The identifier of the message.
+    pub msg_id: Option<String>,
+    /// The counter of the envelope (protocol §2.1).
+    pub seq: Option<u64>,
+    /// The body of the push: the name of the key and the value as text.
+    pub fields: Vec<(String, String)>,
+}
+
+/// Parse the open text of a `PUSH` frame (protocol §2.5.4, §2.5.5).
+///
+/// `None` means the text is not a push: the type of the envelope is neither
+/// "status" nor "event", or the body is not an object. Such a text is shown
+/// as it is.
+#[allow(dead_code)]
+pub fn parse_push(text: &[u8]) -> Option<Push> {
+    let Envelope {
+        msg_type,
+        msg_id,
+        seq,
+        payload,
+        ..
+    } = Envelope::parse(text)?;
+    let kind = match msg_type.as_str() {
+        MSG_TYPE_STATUS => PushKind::Status,
+        MSG_TYPE_EVENT => PushKind::Event,
+        _ => return None,
+    };
+    // The body of a push is an object (protocol §2.5.4, §2.5.5); a body of
+    // another shape is not a push.
+    let body = payload.as_object()?;
+    Some(Push {
+        kind,
+        msg_id,
+        seq,
+        fields: body_fields(body),
+    })
+}
+
+/// The fields of the body of a push: the name of the key and the value.
+///
+/// A nested object is flattened one level: the key of the inner object is
+/// appended to the outer key with a dot (`fw.esp`). A string value is kept as
+/// it is, every other value is the compact JSON of the value.
+fn body_fields(body: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    for (key, value) in body {
+        match value {
+            serde_json::Value::Object(inner) => {
+                for (inner_key, inner_value) in inner {
+                    fields.push((format!("{key}.{inner_key}"), field_value(inner_value)));
+                }
+            }
+            value => fields.push((key.clone(), field_value(value))),
+        }
+    }
+    fields
+}
+
+/// The value of a field as text: a string as it is, every other value as the
+/// compact JSON of the value.
+fn field_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -877,6 +981,7 @@ mod tests {
         assert!(!envelope.is_command());
         assert_eq!(envelope.msg_id.as_deref(), Some("a-1"));
         assert_eq!(envelope.correlation_id.as_deref(), Some("c-1"));
+        assert_eq!(envelope.seq, Some(2));
         assert_eq!(envelope.result(), Some("applied"));
         assert_eq!(envelope.command_name(), None);
     }
@@ -1028,5 +1133,66 @@ mod tests {
         let object = value.as_object().unwrap();
         assert_eq!(object.len(), 8);
         assert_eq!(object["device_id"], "");
+    }
+
+    #[test]
+    fn a_status_push_is_parsed() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"status","msg_id":"status-3",
+            "device_id":"","ts_utc":"2026-11-27T10:00:00.000Z","seq":12,"source":"device",
+            "payload":{"mcu_connected":true,"wifi_rssi":-59,"fw":{"esp":"1.2.3","proto":"1.0"},
+            "active_errors":[],"ota":null}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        assert_eq!(push.kind, PushKind::Status);
+        assert_eq!(push.msg_id.as_deref(), Some("status-3"));
+        assert_eq!(push.seq, Some(12));
+        assert!(
+            push.fields
+                .contains(&("mcu_connected".to_string(), "true".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("wifi_rssi".to_string(), "-59".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("fw.esp".to_string(), "1.2.3".to_string()))
+        );
+        assert!(
+            push.fields
+                .contains(&("ota".to_string(), "null".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_event_push_is_parsed() {
+        let text = br#"{"protocol_version":"1.0","msg_type":"event","msg_id":"event-7",
+            "device_id":"","ts_utc":"2026-11-27T10:00:01.000Z","seq":13,"source":"device",
+            "payload":{"event_type":"bowl_overflow","bowl_id":"1"}}"#;
+        let push = parse_push(text).expect("the text is an event push");
+        assert_eq!(push.kind, PushKind::Event);
+        assert!(
+            push.fields
+                .contains(&("event_type".to_string(), "bowl_overflow".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_status_without_the_optional_keys_is_parsed() {
+        // The snapshot does not have to carry device_state or fw.mcu.
+        let text = br#"{"msg_type":"status","payload":{"mcu_connected":false}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        assert_eq!(push.fields.len(), 1);
+        assert_eq!(
+            push.fields[0],
+            ("mcu_connected".to_string(), "false".to_string())
+        );
+    }
+
+    #[test]
+    fn a_text_that_is_not_a_push_stays_raw() {
+        // A body that is not an object, an unknown type, a broken JSON.
+        assert!(parse_push(br#"{"msg_type":"ack","payload":{}}"#).is_none());
+        assert!(parse_push(br#"{"msg_type":"status","payload":"text"}"#).is_none());
+        assert!(parse_push(b"not json").is_none());
     }
 }
