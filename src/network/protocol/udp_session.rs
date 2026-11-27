@@ -19,7 +19,8 @@ use crate::network::events::{ConnectionEvent, NetCounters, WireMessage};
 use crate::network::interfaces::{NetworkConnection, NetworkServer};
 use crate::reply::ReplyRulesStore;
 use crate::session_udp::codec::{
-    Frame, HANDSHAKE_NONCE_LEN, PacketType, encode, format_frame_fields,
+    Frame, HANDSHAKE_NONCE_LEN, PacketType, PushKind, encode, format_fields, format_frame_fields,
+    push_fields,
 };
 use crate::session_udp::machine::{
     Action, Command, CommandReply, Machine, PendingCommand, ReplyOutcome, Trace,
@@ -156,6 +157,20 @@ fn trace_lines(trace: &Trace) -> Vec<(MessageStage, MessageDirection, String)> {
             MessageDirection::Received,
             t!("udp_session.trace_open_session").to_string(),
         ),
+        Trace::Push { push } => {
+            // The prose names the kind of the push; the names below it are
+            // identifiers of the protocol, so they stay as they are.
+            let prose = match push.kind {
+                PushKind::Status => t!("udp_session.trace_push_status").to_string(),
+                PushKind::Event => t!("udp_session.trace_push_event").to_string(),
+            };
+            let fields = format_fields(&push_fields(push));
+            (
+                MessageStage::Push,
+                MessageDirection::Received,
+                format!("{prose}\n{fields}"),
+            )
+        }
     };
     vec![line]
 }
@@ -743,7 +758,7 @@ mod tests {
     use crate::reply::model::{ReplyPayload, ReplyRule, ReplyRulesConfig};
     use crate::session_udp::codec::{
         Body, DIRECTION_ESP_TO_APP, Frame, HKDF_INFO, Header, MAX_DATAGRAM, build_nonce, decode,
-        header_bytes, proof_a_input, proof_b_input,
+        header_bytes, parse_push, proof_a_input, proof_b_input,
     };
     use crate::session_udp::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256};
     use smol::channel::Receiver;
@@ -1712,6 +1727,46 @@ mod tests {
         assert!(!text.contains("payload:"));
         assert!(!text.contains("secret-body"));
         assert!(!text.contains("abababab"));
+    }
+
+    /// The push line: the stage of the push, the prose of its kind and the
+    /// fields of the snapshot.
+    #[test]
+    fn a_push_line_has_the_prose_and_the_fields() {
+        let push = parse_push(
+            br#"{"msg_type":"status","msg_id":"status-7","seq":12,
+                "payload":{"mcu_connected":true}}"#,
+        )
+        .expect("the text is a status push");
+        let lines = trace_lines(&Trace::Push { push });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, MessageStage::Push);
+        assert_eq!(lines[0].1, MessageDirection::Received);
+        let text = &lines[0].2;
+        // The prose names the kind of the push; the fields below it are the
+        // identifiers of the protocol.
+        assert!(text.starts_with(t!("udp_session.trace_push_status").as_ref()));
+        assert!(text.contains("msg_type: status"));
+        assert!(text.contains("msg_id: status-7"));
+        assert!(text.contains("seq: 12"));
+        assert!(text.contains("mcu_connected: true"));
+    }
+
+    /// The push line of an event: the prose of the other kind.
+    #[test]
+    fn an_event_push_line_names_the_event() {
+        let push = parse_push(
+            br#"{"msg_type":"event","msg_id":"event-1",
+                "payload":{"event_type":"bowl_overflow"}}"#,
+        )
+        .expect("the text is an event push");
+        let lines = trace_lines(&Trace::Push { push });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, MessageStage::Push);
+        let text = &lines[0].2;
+        assert!(text.starts_with(t!("udp_session.trace_push_event").as_ref()));
+        assert!(text.contains("msg_type: event"));
+        assert!(text.contains("event_type: bowl_overflow"));
     }
 
     #[tokio::test]

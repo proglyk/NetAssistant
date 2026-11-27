@@ -1086,6 +1086,12 @@ udp_session:
   trace_open_session:
     zh-CN: 会话已建立
     en: open session
+  trace_push_status:
+    zh-CN: PUSH 状态快照
+    en: PUSH status snapshot
+  trace_push_event:
+    zh-CN: PUSH 事件
+    en: PUSH event
   trace_send:
     zh-CN: 发送 %{packet}
     en: send %{packet}

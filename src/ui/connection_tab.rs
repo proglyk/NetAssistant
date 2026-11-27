@@ -4088,6 +4088,7 @@ fn stage_color(stage: MessageStage) -> Rgba {
         MessageStage::Session => gpui_kit::rgb(0x4ade80),
         MessageStage::Handshake => gpui_kit::rgb(0xfacc15),
         MessageStage::Sender => gpui_kit::rgb(0xa78bfa),
+        MessageStage::Push => gpui_kit::rgb(0x38bdf8),
     }
 }
 

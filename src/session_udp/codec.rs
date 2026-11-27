@@ -440,14 +440,9 @@ pub const MSG_TYPE_COMMAND: &str = "command";
 pub const MSG_TYPE_ACK: &str = "ack";
 /// Message type of a negative answer (protocol §2.1).
 pub const MSG_TYPE_ERROR: &str = "error";
-// The push API (`MSG_TYPE_STATUS`, `MSG_TYPE_EVENT`, `PushKind`, `Push` and
-// `parse_push`) is introduced as one cluster and is read by the journal layer
-// that follows it; until then the unused-item lint is muted on each item.
 /// Message type of a status snapshot of the device (protocol §2.5.4).
-#[allow(dead_code)]
 pub const MSG_TYPE_STATUS: &str = "status";
 /// Message type of an event of the device (protocol §2.5.5).
-#[allow(dead_code)]
 pub const MSG_TYPE_EVENT: &str = "event";
 
 /// The scope of a command of the application (protocol §2.4.2).
@@ -670,7 +665,6 @@ impl Envelope {
 }
 
 /// The kind of a push of the device (protocol §2.5.4, §2.5.5).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushKind {
     /// A status snapshot of the device.
@@ -685,7 +679,6 @@ pub enum PushKind {
 /// The body of the push is flattened into `fields`: the name of the key and
 /// the value as text. A nested object is flattened one level, with a dot
 /// between the names (`fw.esp`).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Push {
     /// Whether the push is a status snapshot or an event.
@@ -703,7 +696,6 @@ pub struct Push {
 /// `None` means the text is not a push: the type of the envelope is neither
 /// "status" nor "event", or the body is not an object. Such a text is shown
 /// as it is.
-#[allow(dead_code)]
 pub fn parse_push(text: &[u8]) -> Option<Push> {
     let Envelope {
         msg_type,
@@ -726,6 +718,43 @@ pub fn parse_push(text: &[u8]) -> Option<Push> {
         seq,
         fields: body_fields(body),
     })
+}
+
+/// The fields of a push for the journal: the name of the field and the value.
+///
+/// The order follows the envelope (protocol §2.1): the type of the message,
+/// then its identifier and its counter, then the body of the push as the
+/// device sent it. The names are identifiers of the protocol, so the journal
+/// shows them as they are.
+pub fn push_fields(push: &Push) -> Vec<(String, String)> {
+    let mut fields = Vec::with_capacity(push.fields.len() + 3);
+    fields.push((
+        "msg_type".to_string(),
+        match push.kind {
+            PushKind::Status => MSG_TYPE_STATUS.to_string(),
+            PushKind::Event => MSG_TYPE_EVENT.to_string(),
+        },
+    ));
+    if let Some(msg_id) = &push.msg_id {
+        fields.push(("msg_id".to_string(), msg_id.clone()));
+    }
+    if let Some(seq) = push.seq {
+        fields.push(("seq".to_string(), seq.to_string()));
+    }
+    fields.extend(push.fields.iter().cloned());
+    fields
+}
+
+/// The fields of a journal line: `name: value` per line.
+///
+/// The shape is the one of `format_frame_fields`: the journal shows the
+/// fields of a protocol event one per line.
+pub fn format_fields(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// The fields of the body of a push: the name of the key and the value.
@@ -1378,5 +1407,30 @@ mod tests {
         assert!(parse_push(br#"{"msg_type":"ack","payload":{}}"#).is_none());
         assert!(parse_push(br#"{"msg_type":"status","payload":"text"}"#).is_none());
         assert!(parse_push(b"not json").is_none());
+    }
+
+    #[test]
+    fn the_push_fields_name_the_message_and_the_body() {
+        let text = br#"{"msg_type":"status","msg_id":"status-3","seq":12,
+            "payload":{"mcu_connected":true,"fw":{"esp":"1.2.3"}}}"#;
+        let push = parse_push(text).expect("the text is a status push");
+        let fields = push_fields(&push);
+        assert!(fields.contains(&("msg_type".to_string(), "status".to_string())));
+        assert!(fields.contains(&("msg_id".to_string(), "status-3".to_string())));
+        assert!(fields.contains(&("seq".to_string(), "12".to_string())));
+        assert!(fields.contains(&("mcu_connected".to_string(), "true".to_string())));
+        assert!(fields.contains(&("fw.esp".to_string(), "1.2.3".to_string())));
+    }
+
+    #[test]
+    fn the_fields_are_rendered_one_per_line() {
+        let fields = vec![
+            ("result".to_string(), "applied".to_string()),
+            ("device_state".to_string(), "unknown".to_string()),
+        ];
+        assert_eq!(
+            format_fields(&fields),
+            "result: applied\ndevice_state: unknown"
+        );
     }
 }

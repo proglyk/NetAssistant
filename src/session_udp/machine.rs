@@ -15,8 +15,8 @@
 use crate::session_udp::codec::{
     Body, DIRECTION_APP_TO_ESP, DIRECTION_ESP_TO_APP, DecodeError, Envelope, Frame,
     HANDSHAKE_NONCE_LEN, HKDF_INFO, Header, MAX_PLAINTEXT, MSG_TYPE_ACK, MSG_TYPE_ERROR,
-    PacketType, TIMESTAMP_WINDOW_SECONDS, build_nonce, command_envelope, decode, header_bytes,
-    nonce_matches, proof_a_input, proof_b_input,
+    PacketType, Push, TIMESTAMP_WINDOW_SECONDS, build_nonce, command_envelope, decode,
+    header_bytes, nonce_matches, parse_push, proof_a_input, proof_b_input,
 };
 use crate::session_udp::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, hkdf_sha256, hmac_sha256, hmac_verify,
@@ -161,6 +161,11 @@ pub enum Trace {
     },
     /// The session key was derived and the session is open (session stage).
     SessionOpen,
+    /// A push of the device: a status snapshot or an event (push stage).
+    Push {
+        /// The parsed push.
+        push: Push,
+    },
 }
 
 /// State machine output.
@@ -561,9 +566,16 @@ impl Machine {
                 actions
             }
             PacketType::Push => {
-                // The body of a push is not parsed: the snapshots and the
-                // events are not in the scope of the client yet (spec F).
-                vec![Action::Deliver(plain)]
+                // The open text of a push goes to the journal as it is, and
+                // the parsed push comes aside: the journal shows the fields
+                // of the snapshot (push stage). A text that is not a push has
+                // no fields to show: the decoder line keeps it.
+                let push = parse_push(&plain);
+                let mut actions = vec![Action::Deliver(plain)];
+                if let Some(push) = push {
+                    actions.push(Action::Trace(Trace::Push { push }));
+                }
+                actions
             }
             PacketType::Close => {
                 // The peer closed the session: the reason is read from the
@@ -906,7 +918,7 @@ fn normalize_sent_name(cmd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_udp::codec::{PROOF_LEN, encode, format_frame_fields};
+    use crate::session_udp::codec::{PROOF_LEN, PushKind, encode, format_frame_fields};
     use crate::session_udp::crypto::NONCE_LEN;
 
     const PSK: &str = "super-secret-psk";
@@ -1501,12 +1513,63 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::Deliver(p) if p == b"snapshot"))
         );
+        // A text that is not a push has no fields to show: the journal keeps
+        // the raw text in the decoder line, and no push line appears.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace(Trace::Push { .. })))
+        );
         // The session is still open: a DATA frame is still delivered.
         let actions = m.handle(Command::Packet(device_data(2, b"more")), NOW);
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::Deliver(p) if p == b"more"))
+        );
+    }
+
+    #[test]
+    fn a_push_frame_that_is_not_a_push_has_no_push_trace() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        // An envelope of another kind: the type is neither "status" nor
+        // "event", so the body is not a push and there is nothing to show in
+        // the push line.
+        let plain = br#"{"msg_type":"ack","payload":{}}"#;
+        let frame = device_frame(PacketType::Push, 1, NOW, plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Deliver(p) if p == plain))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace(Trace::Push { .. })))
+        );
+    }
+
+    #[test]
+    fn a_push_frame_carries_the_parsed_push() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let plain =
+            br#"{"msg_type":"status","msg_id":"status-1","payload":{"mcu_connected":true}}"#;
+        let frame = device_frame(PacketType::Push, 1, NOW, plain);
+        let actions = m.handle(Command::Packet(frame), NOW);
+        let push = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Trace(Trace::Push { push }) => Some(push),
+                _ => None,
+            })
+            .expect("the frame carries a push");
+        assert_eq!(push.kind, PushKind::Status);
+        assert!(
+            push.fields
+                .contains(&("mcu_connected".to_string(), "true".to_string()))
         );
     }
 
