@@ -218,6 +218,9 @@ new_connection:
   udp_session_retries_label:
     zh-CN: HELLO 重试次数
     en: HELLO retries
+  udp_session_device_id_label:
+    zh-CN: 设备 ID（写入命令，可留空）
+    en: Device ID (written into commands, optional)
   error_bad_protocol:
     zh-CN: 未知协议
     en: Unknown protocol

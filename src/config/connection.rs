@@ -410,6 +410,10 @@ pub struct UdpSessionSettings {
     /// HELLO 重发次数（首次 HELLO 之外的重试次数）
     #[serde(default = "default_hello_retries")]
     pub hello_retries: u8,
+    /// 设备 ID（协议 §2.1 的 `device_id`）：写进命令信封的顶层字段。
+    /// 空串表示未知：此时该字段不写进信封。
+    #[serde(default)]
+    pub device_id: String,
 }
 
 fn default_handshake_timeout_ms() -> u64 {
@@ -426,6 +430,7 @@ impl Default for UdpSessionSettings {
             psk: String::new(),
             handshake_timeout_ms: default_handshake_timeout_ms(),
             hello_retries: default_hello_retries(),
+            device_id: String::new(),
         }
     }
 }
@@ -651,6 +656,16 @@ mod tests {
         assert_eq!(settings.psk, "s");
         assert_eq!(settings.handshake_timeout_ms, 1000);
         assert_eq!(settings.hello_retries, 3);
+        // 旧配置里没有设备 ID：命令信封不写这个字段
+        assert_eq!(settings.device_id, "");
+    }
+
+    #[test]
+    fn the_udp_session_device_id_is_kept() {
+        let raw = r#"{"id":"1","protocol":"udpsession","server_address":"127.0.0.1","server_port":9,"udp_session":{"psk":"s","device_id":"dev_00001A2B3C"}}"#;
+        let cfg: ClientConfig = serde_json::from_str(raw).unwrap();
+        let settings = cfg.udp_session.unwrap();
+        assert_eq!(settings.device_id, "dev_00001A2B3C");
     }
 
     #[test]

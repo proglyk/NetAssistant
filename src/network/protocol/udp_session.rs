@@ -734,6 +734,8 @@ mod tests {
     const CONN_ID: &str = "udp-session-loopback";
     const SESSION_ID: u16 = 0x1234;
     const NONCE_B: [u8; HANDSHAKE_NONCE_LEN] = [4u8; HANDSHAKE_NONCE_LEN];
+    /// The device the client talks to (protocol §2.1).
+    const DEVICE_ID: &str = "dev_00001A2B3C";
 
     /// Client configuration: connects to a local peer, binds the loopback address explicitly
     /// (the Connected event carries the real local port).
@@ -748,6 +750,7 @@ mod tests {
                 psk: PSK.to_string(),
                 handshake_timeout_ms: 1000,
                 hello_retries: 3,
+                device_id: DEVICE_ID.to_string(),
             }),
             ..Default::default()
         }
