@@ -542,6 +542,17 @@ fn render_udp_session_fields(app: &Entity<NetAssistantApp>, theme: &Theme, cx: &
                 ))
                 .child(Input::new(&state.udp_session_retries_input).cleanable(true)),
         )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(field_label(
+                    theme,
+                    t!("new_connection.udp_session_device_id_label").to_string(),
+                ))
+                .child(Input::new(&state.udp_session_device_id_input).cleanable(true)),
+        )
 }
 
 /// 渲染 MQTT 协议版本芯片

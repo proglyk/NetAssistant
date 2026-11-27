@@ -441,22 +441,50 @@ pub const MSG_TYPE_ACK: &str = "ack";
 /// Message type of a negative answer (protocol §2.1).
 pub const MSG_TYPE_ERROR: &str = "error";
 
+/// The scope of a command of the application (protocol §2.4.2).
+///
+/// "device" is the scope that every device supports (protocol §2.4.2).
+pub const COMMAND_SCOPE: &str = "device";
+/// The lifetime of a command of the application, in seconds (protocol §2.5.1).
+pub const COMMAND_TTL_SEC: u32 = 30;
+
 /// JSON body of an outgoing command.
 ///
-/// Seven fields and no others. The caller supplies the identifier, the clock
+/// The envelope fields of protocol §2.1 and the command payload of protocol
+/// §2.5.1. The caller supplies the identifier, the device id, the clock
 /// string, the JSON sequence, and the already trimmed command name. Key order
 /// is not part of the contract.
-pub fn command_envelope(msg_id: &str, ts_utc: &str, seq: u32, cmd: &str) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "protocol_version": "1.0",
-        "msg_type": MSG_TYPE_COMMAND,
-        "msg_id": msg_id,
-        "ts_utc": ts_utc,
-        "seq": seq,
-        "source": "app",
-        "payload": { "cmd": cmd }
-    }))
-    .expect("command envelope is a fixed JSON object")
+pub fn command_envelope(
+    msg_id: &str,
+    device_id: &str,
+    ts_utc: &str,
+    seq: u32,
+    cmd: &str,
+) -> Vec<u8> {
+    let mut object = serde_json::Map::new();
+    object.insert("protocol_version".into(), "1.0".into());
+    object.insert("msg_type".into(), MSG_TYPE_COMMAND.into());
+    object.insert("msg_id".into(), msg_id.into());
+    // The device id is a setting of the connection. An empty one is left out
+    // of the envelope: the client does not know the id of the device it talks
+    // to until the user writes it down.
+    if !device_id.is_empty() {
+        object.insert("device_id".into(), device_id.into());
+    }
+    object.insert("ts_utc".into(), ts_utc.into());
+    object.insert("seq".into(), seq.into());
+    object.insert("source".into(), "app".into());
+    object.insert(
+        "payload".into(),
+        serde_json::json!({
+            "cmd": cmd,
+            "scope": COMMAND_SCOPE,
+            "ttl_sec": COMMAND_TTL_SEC,
+            "params": {},
+        }),
+    );
+    serde_json::to_vec(&serde_json::Value::Object(object))
+        .expect("command envelope is a fixed JSON object")
 }
 
 /// The JSON envelope of a business message (protocol §2.1).
@@ -963,21 +991,45 @@ mod tests {
     }
 
     #[test]
-    fn command_envelope_has_the_seven_fields() {
-        let bytes = command_envelope("cmd-1", "2023-11-14T22:13:20.000Z", 1, "get_status");
+    fn command_envelope_has_the_fields_of_the_protocol() {
+        let bytes = command_envelope(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "dev_00001A2B3C",
+            "2023-11-14T22:13:20.000Z",
+            1,
+            "get_status",
+        );
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 7);
+        assert_eq!(object.len(), 8);
         assert_eq!(object["protocol_version"], "1.0");
         assert_eq!(object["msg_type"], "command");
-        assert_eq!(object["msg_id"], "cmd-1");
+        assert_eq!(object["msg_id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(object["device_id"], "dev_00001A2B3C");
         assert_eq!(object["ts_utc"], "2023-11-14T22:13:20.000Z");
         assert_eq!(object["seq"], serde_json::json!(1));
         assert_eq!(object["source"], "app");
         assert_eq!(object["payload"]["cmd"], "get_status");
-        assert_eq!(object["payload"].as_object().unwrap().len(), 1);
+        assert_eq!(object["payload"]["scope"], "device");
+        assert_eq!(object["payload"]["ttl_sec"], serde_json::json!(30));
+        assert_eq!(object["payload"]["params"], serde_json::json!({}));
+        assert_eq!(object["payload"].as_object().unwrap().len(), 4);
         assert!(object.get("correlation_id").is_none());
-        assert!(object.get("device_id").is_none());
         assert!(object.get("signature").is_none());
+    }
+
+    #[test]
+    fn an_empty_device_id_is_left_out_of_the_envelope() {
+        let bytes = command_envelope(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "",
+            "2023-11-14T22:13:20.000Z",
+            1,
+            "get_status",
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 7);
+        assert!(object.get("device_id").is_none());
     }
 }

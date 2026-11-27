@@ -212,6 +212,8 @@ pub struct NetAssistantApp {
     pub udp_session_timeout_input: Entity<InputState>,
     /// HELLO 重试次数
     pub udp_session_retries_input: Entity<InputState>,
+    /// 设备 ID（协议 §2.1 的 `device_id`，写进命令信封；可留空）
+    pub udp_session_device_id_input: Entity<InputState>,
 
     // 解码器选择对话框状态(打开时创建, 关闭时置 None)
     pub decoder_selection_dialog: Option<DecoderSelectionDialogState>,
@@ -419,6 +421,8 @@ impl NetAssistantApp {
         let udp_session_psk_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_timeout_input = cx.new(|cx| InputState::new(window, cx));
         let udp_session_retries_input = cx.new(|cx| InputState::new(window, cx));
+        // 设备 ID 可留空：留空时命令信封不写 device_id
+        let udp_session_device_id_input = cx.new(|cx| InputState::new(window, cx));
         // TLS 证书路径输入（可手动填写，也可由「选择文件」回填）
         let mqtt_tls_ca_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -578,6 +582,7 @@ impl NetAssistantApp {
             udp_session_psk_input,
             udp_session_timeout_input,
             udp_session_retries_input,
+            udp_session_device_id_input,
             // 初始化解码器选择对话框状态
             decoder_selection_dialog: None,
             server_expanded: true,
@@ -2130,6 +2135,8 @@ impl NetAssistantApp {
             .update(cx, |i, cx| i.set_value("1000".to_string(), window, cx));
         self.udp_session_retries_input
             .update(cx, |i, cx| i.set_value("3".to_string(), window, cx));
+        self.udp_session_device_id_input
+            .update(cx, |i, cx| i.set_value(String::new(), window, cx));
 
         let default_host = if is_client { "127.0.0.1" } else { "0.0.0.0" };
         self.host_input.update(cx, |i, cx| {
@@ -2328,13 +2335,14 @@ impl NetAssistantApp {
             }
             _ => None,
         };
-        let (udp_psk, udp_timeout, udp_retries) = match udp_settings {
+        let (udp_psk, udp_timeout, udp_retries, udp_device_id) = match udp_settings {
             Some(s) => (
                 s.psk,
                 s.handshake_timeout_ms.to_string(),
                 s.hello_retries.to_string(),
+                s.device_id,
             ),
-            None => (String::new(), String::new(), String::new()),
+            None => (String::new(), String::new(), String::new(), String::new()),
         };
         self.udp_session_psk_input
             .update(cx, |i, cx| i.set_value(udp_psk, window, cx));
@@ -2342,6 +2350,8 @@ impl NetAssistantApp {
             .update(cx, |i, cx| i.set_value(udp_timeout, window, cx));
         self.udp_session_retries_input
             .update(cx, |i, cx| i.set_value(udp_retries, window, cx));
+        self.udp_session_device_id_input
+            .update(cx, |i, cx| i.set_value(udp_device_id, window, cx));
 
         // 命令式打开对话框(由 Root 管理层叠)
         open_new_connection_dialog(cx.entity().downgrade(), window, cx);
@@ -2636,6 +2646,12 @@ impl NetAssistantApp {
                 psk,
                 handshake_timeout_ms,
                 hello_retries,
+                device_id: self
+                    .udp_session_device_id_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string(),
             })
         } else {
             None

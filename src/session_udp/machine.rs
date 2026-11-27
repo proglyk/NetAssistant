@@ -66,6 +66,12 @@ pub enum Command {
         cmd: String,
         /// Five random bytes for the nonce tail, same as `UserBytes`.
         nonce_tail: [u8; 5],
+        /// The identifier of the message (protocol §2.1): a UUID, made outside
+        /// the machine, which has no random source of its own.
+        msg_id: String,
+        /// The identifier of the device the command goes to (protocol §2.1).
+        /// An empty one is left out of the envelope.
+        device_id: String,
     },
     /// The user disconnected.
     UserDisconnect {
@@ -200,8 +206,6 @@ enum State {
         rx_seq: Option<u32>,
         /// The commands that wait for an answer.
         pending: Vec<PendingCommand>,
-        /// Number of the next command: `cmd-1`, `cmd-2`, ...
-        next_cmd: u32,
         /// Sequence number of the next command envelope.
         json_seq: u32,
     },
@@ -233,7 +237,12 @@ impl Machine {
             } => self.on_start(nonce_a, psk, hello_retries, now),
             Command::Tick => self.on_tick(now),
             Command::Packet(frame) => self.on_packet(frame, now),
-            Command::SendCommand { cmd, nonce_tail } => self.on_send_command(cmd, nonce_tail, now),
+            Command::SendCommand {
+                cmd,
+                nonce_tail,
+                msg_id,
+                device_id,
+            } => self.on_send_command(cmd, nonce_tail, msg_id, device_id, now),
             Command::UserBytes { bytes, nonce_tail } => self.on_user_bytes(bytes, nonce_tail, now),
             Command::UserDisconnect { nonce_tail } => self.on_user_disconnect(nonce_tail, now),
         }
@@ -448,8 +457,7 @@ impl Machine {
                         rx_seq: None,
                         // No command has been sent yet.
                         pending: Vec::new(),
-                        // Both counters start at one and die with the session.
-                        next_cmd: 1,
+                        // The counter starts at one and dies with the session.
                         json_seq: 1,
                     },
                     vec![
@@ -686,31 +694,32 @@ impl Machine {
     /// sends it as the body of a `DATA` frame.
     ///
     /// The name is trimmed and an empty one is refused before any datagram:
-    /// the counters of the session grow only for an accepted command.
-    fn on_send_command(&mut self, cmd: String, nonce_tail: [u8; 5], now: u32) -> Vec<Action> {
+    /// the counter of the session grows only for an accepted command.
+    fn on_send_command(
+        &mut self,
+        cmd: String,
+        nonce_tail: [u8; 5],
+        msg_id: String,
+        device_id: String,
+        now: u32,
+    ) -> Vec<Action> {
         let Some(name) = normalize_sent_name(&cmd) else {
             return Vec::new();
         };
         if !matches!(self.state, State::Established { .. }) {
             return vec![Action::Warn("not established".to_string())];
         }
-        let (msg_n, seq) = match &self.state {
-            State::Established {
-                next_cmd, json_seq, ..
-            } => (*next_cmd, *json_seq),
+        let seq = match &self.state {
+            State::Established { json_seq, .. } => *json_seq,
             _ => return Vec::new(),
         };
-        let body = command_envelope(&format!("cmd-{msg_n}"), &format_ts_utc(now), seq, &name);
+        let body = command_envelope(&msg_id, &device_id, &format_ts_utc(now), seq, &name);
         let actions = self.on_user_bytes(body, nonce_tail, now);
         let sent = actions
             .iter()
             .any(|action| matches!(action, Action::Send(_, _)));
         if sent {
-            if let State::Established {
-                next_cmd, json_seq, ..
-            } = &mut self.state
-            {
-                *next_cmd += 1;
+            if let State::Established { json_seq, .. } = &mut self.state {
                 *json_seq += 1;
             }
         }
@@ -1895,39 +1904,47 @@ mod tests {
         serde_json::from_slice(&plain_of(actions)).unwrap()
     }
 
+    /// The identifier of a command of the test: the adapter makes a UUID
+    /// (protocol §2.1).
+    const MSG_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// The device of the test (protocol §2.1).
+    const DEVICE_ID: &str = "dev_00001A2B3C";
+
+    /// A command of the user with the identity of the message.
+    fn send_command(cmd: &str) -> Command {
+        Command::SendCommand {
+            cmd: cmd.to_string(),
+            nonce_tail: tail(),
+            msg_id: MSG_ID.to_string(),
+            device_id: DEVICE_ID.to_string(),
+        }
+    }
+
     #[test]
     fn send_command_builds_the_envelope_from_now() {
         let mut m = Machine::new();
         establish(&mut m);
-        let actions = m.handle(
-            Command::SendCommand {
-                cmd: "  get_status  ".into(),
-                nonce_tail: tail(),
-            },
-            NOW,
-        );
+        let actions = m.handle(send_command("  get_status  "), NOW);
         let value = envelope_of(&actions);
-        assert_eq!(value["msg_id"], "cmd-1");
+        assert_eq!(value["msg_id"], MSG_ID);
+        assert_eq!(value["device_id"], DEVICE_ID);
         assert_eq!(value["seq"], serde_json::json!(1));
         assert_eq!(value["ts_utc"], "2023-11-14T22:13:20.000Z");
         assert_eq!(value["payload"]["cmd"], "get_status");
-        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["payload"]["scope"], "device");
+        assert_eq!(value["payload"]["ttl_sec"], serde_json::json!(30));
+        assert_eq!(value["payload"]["params"], serde_json::json!({}));
+        assert_eq!(value.as_object().unwrap().len(), 8);
         let text = format_frame_fields(sent(&actions), Some(&plain_of(&actions)));
         assert!(text.contains("payload: "));
         assert!(text.contains("get_status"));
     }
 
     #[test]
-    fn a_second_command_grows_both_counters() {
+    fn a_second_command_grows_the_json_sequence() {
         let mut m = Machine::new();
         establish(&mut m);
-        let _ = m.handle(
-            Command::SendCommand {
-                cmd: "get_status".into(),
-                nonce_tail: tail(),
-            },
-            NOW,
-        );
+        let _ = m.handle(send_command("get_status"), NOW);
         // A raw datagram spends a header sequence number and not a JSON seq.
         let _ = m.handle(
             Command::UserBytes {
@@ -1940,11 +1957,15 @@ mod tests {
             Command::SendCommand {
                 cmd: "get_capabilities".into(),
                 nonce_tail: tail(),
+                msg_id: "11111111-2222-4333-8444-555555555555".into(),
+                device_id: DEVICE_ID.into(),
             },
             NOW,
         );
         let value = envelope_of(&actions);
-        assert_eq!(value["msg_id"], "cmd-2");
+        // The identifier comes from the caller: the machine does not number
+        // the commands.
+        assert_eq!(value["msg_id"], "11111111-2222-4333-8444-555555555555");
         assert_eq!(value["seq"], serde_json::json!(2));
         assert_eq!(sent(&actions).header.seq_num, 3);
     }
@@ -1954,36 +1975,19 @@ mod tests {
         let mut m = Machine::new();
         establish(&mut m);
         for blank in ["", "   ", "\n"] {
-            let actions = m.handle(
-                Command::SendCommand {
-                    cmd: blank.into(),
-                    nonce_tail: tail(),
-                },
-                NOW,
-            );
+            let actions = m.handle(send_command(blank), NOW);
             assert!(actions.is_empty(), "{blank:?}");
         }
-        let actions = m.handle(
-            Command::SendCommand {
-                cmd: "get_status".into(),
-                nonce_tail: tail(),
-            },
-            NOW,
-        );
-        assert_eq!(envelope_of(&actions)["msg_id"], "cmd-1");
+        let actions = m.handle(send_command("get_status"), NOW);
+        // The refused commands did not spend the counter.
+        assert_eq!(envelope_of(&actions)["seq"], serde_json::json!(1));
     }
 
     #[test]
     fn send_command_before_the_session_sends_nothing() {
         let mut m = Machine::new();
         let _ = start(&mut m);
-        let actions = m.handle(
-            Command::SendCommand {
-                cmd: "get_status".into(),
-                nonce_tail: tail(),
-            },
-            NOW,
-        );
+        let actions = m.handle(send_command("get_status"), NOW);
         assert!(
             !actions
                 .iter()
@@ -1995,16 +1999,10 @@ mod tests {
     fn send_command_correlates_the_ack_and_leaves_an_unbound_error() {
         let mut m = Machine::new();
         establish(&mut m);
-        let _ = m.handle(
-            Command::SendCommand {
-                cmd: "get_status".into(),
-                nonce_tail: tail(),
-            },
-            NOW,
-        );
+        let _ = m.handle(send_command("get_status"), NOW);
         let ack = serde_json::json!({
             "msg_type": "ack",
-            "correlation_id": "cmd-1",
+            "correlation_id": MSG_ID,
             "payload": { "result": "applied" }
         })
         .to_string()
@@ -2018,7 +2016,7 @@ mod tests {
             Action::Reply(CommandReply {
                 outcome: ReplyOutcome::Ack { .. },
                 command: Some(PendingCommand { msg_id, cmd }),
-            }) if msg_id == "cmd-1" && cmd.as_deref() == Some("get_status")
+            }) if msg_id == MSG_ID && cmd.as_deref() == Some("get_status")
         )));
 
         let err = serde_json::json!({
