@@ -1092,6 +1092,12 @@ udp_session:
   trace_push_event:
     zh-CN: PUSH 事件
     en: PUSH event
+  trace_reply_ack:
+    zh-CN: 设备回应
+    en: device reply
+  trace_reply_error:
+    zh-CN: 设备报错
+    en: device error
   trace_send:
     zh-CN: 发送 %{packet}
     en: send %{packet}
@@ -1113,6 +1119,12 @@ udp_session:
   reply_error_command:
     zh-CN: 设备对命令 %{command} 报错：%{code}
     en: "Device failed %{command}: %{code}"
+  reply_ack_state:
+    zh-CN: 设备回应：%{result}（%{state}）
+    en: "Device reply: %{result} (%{state})"
+  reply_error_message:
+    zh-CN: 设备报错：%{code} — %{message}
+    en: "Device error: %{code} — %{message}"
   hint_waiting:
     zh-CN: 正在握手
     en: Handshake in progress

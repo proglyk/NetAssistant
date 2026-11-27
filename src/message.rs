@@ -31,6 +31,9 @@ impl fmt::Display for MessageDirection {
 ///
 /// `Push` 不在这条路径上：它是设备主动推送的报文（状态快照或事件），单独
 /// 一行，免得和 `DATA` 的回应混在一起。
+///
+/// `Reply` 同样单独一行：它是设备对一条命令的回应，免得和推送、和 `DATA`
+/// 的解码行混在一起。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageStage {
@@ -46,6 +49,8 @@ pub enum MessageStage {
     Sender,
     /// udp:push：设备推送的状态快照或事件
     Push,
+    /// udp:reply：设备对命令的回应
+    Reply,
 }
 
 impl MessageStage {
@@ -58,6 +63,7 @@ impl MessageStage {
             MessageStage::Handshake => "udp:handshake",
             MessageStage::Sender => "udp:sender",
             MessageStage::Push => "udp:push",
+            MessageStage::Reply => "udp:reply",
         }
     }
 }

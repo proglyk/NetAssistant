@@ -130,6 +130,66 @@ pub struct CommandReply {
     pub command: Option<PendingCommand>,
 }
 
+/// The fields of an answer, for the journal line (protocol §2.5.2, §2.5.3).
+///
+/// The name of a field is an identifier of the protocol and is never
+/// translated; the wording of the line belongs to the client. A field the
+/// device did not send stays out: the journal shows what the device said,
+/// not what it could have said.
+pub fn reply_fields(reply: &CommandReply) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    match &reply.outcome {
+        ReplyOutcome::Ack {
+            result,
+            device_state,
+            warnings,
+            data,
+        } => {
+            push_field(&mut fields, "result", result.as_deref());
+            push_field(&mut fields, "device_state", device_state.as_deref());
+            // The warnings are a list: as a JSON array the elements stay apart
+            // and the ones that carry a quote are escaped.
+            let warnings_json = warnings
+                .as_ref()
+                .filter(|list| !list.is_empty())
+                .and_then(|list| serde_json::to_string(list).ok());
+            if let Some(json) = warnings_json {
+                fields.push(("warnings".to_string(), json));
+            }
+            // The data of the answer is JSON already: the codec keeps it as
+            // the compact text of the value.
+            push_field(&mut fields, "data", data.as_deref());
+        }
+        ReplyOutcome::Error {
+            code,
+            severity,
+            message,
+            retryable,
+            details,
+        } => {
+            push_field(&mut fields, "code", code.as_deref());
+            push_field(&mut fields, "severity", severity.as_deref());
+            push_field(&mut fields, "message", message.as_deref());
+            if let Some(retryable) = retryable {
+                fields.push(("retryable".to_string(), retryable.to_string()));
+            }
+            push_field(&mut fields, "details", details.as_deref());
+        }
+    }
+    fields
+}
+
+/// A field of the answer: an absent value and an empty one stay out.
+fn push_field(fields: &mut Vec<(String, String)>, name: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    fields.push((name.to_string(), value.to_string()));
+}
+
 /// Protocol event: the client turns it into a log line with a stage.
 ///
 /// The machine reports facts, not text: the wording belongs to the client,
@@ -2224,6 +2284,75 @@ mod tests {
                 warnings: Some(vec!["hot".to_string(), "3".to_string()]),
                 data: Some(r#"{"bowls":1}"#.to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn the_reply_fields_name_the_outcome_and_its_data() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Error {
+                code: Some("E_COMMAND_NOT_ALLOWED".to_string()),
+                severity: Some("error".to_string()),
+                message: Some("Command not allowed on UDP channel".to_string()),
+                retryable: Some(false),
+                details: Some(r#"{"command":"rotate_local_secret"}"#.to_string()),
+            },
+            command: None,
+        };
+        let fields = reply_fields(&reply);
+        assert!(fields.contains(&("code".to_string(), "E_COMMAND_NOT_ALLOWED".to_string())));
+        assert!(fields.contains(&("severity".to_string(), "error".to_string())));
+        assert!(fields.contains(&(
+            "message".to_string(),
+            "Command not allowed on UDP channel".to_string()
+        )));
+        assert!(fields.contains(&("retryable".to_string(), "false".to_string())));
+        assert!(fields.contains(&(
+            "details".to_string(),
+            r#"{"command":"rotate_local_secret"}"#.to_string()
+        )));
+        // The order of the fields is fixed: the journal shows them as the
+        // protocol names them.
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["code", "severity", "message", "retryable", "details"]
+        );
+    }
+
+    /// An answer without fields gives an empty list: the journal shows what
+    /// the device sent, not what it could have sent.
+    #[test]
+    fn the_reply_fields_of_an_answer_without_fields_are_empty() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: None,
+                device_state: None,
+                warnings: Some(Vec::new()),
+                data: None,
+            },
+            command: None,
+        };
+        assert!(reply_fields(&reply).is_empty());
+    }
+
+    /// An empty value stays out: neither an empty string nor an empty list of
+    /// warnings is a field of the answer.
+    #[test]
+    fn an_empty_value_stays_out_of_the_reply_fields() {
+        let reply = CommandReply {
+            outcome: ReplyOutcome::Ack {
+                result: Some(String::new()),
+                device_state: Some("idle".to_string()),
+                warnings: Some(Vec::new()),
+                data: None,
+            },
+            command: None,
+        };
+        let fields = reply_fields(&reply);
+        assert_eq!(
+            fields,
+            vec![("device_state".to_string(), "idle".to_string())]
         );
     }
 }
