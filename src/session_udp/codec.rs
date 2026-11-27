@@ -574,9 +574,98 @@ impl Envelope {
         self.payload.get("result").and_then(|value| value.as_str())
     }
 
+    /// The state of the device after the command (§2.5.2).
+    pub fn device_state(&self) -> Option<&str> {
+        self.payload
+            .get("device_state")
+            .and_then(|value| value.as_str())
+    }
+
+    /// The warnings of an answer (§2.5.2).
+    ///
+    /// The field is an array: a string element is kept as it is, every other
+    /// element is the compact JSON of the value, so a warning keeps its shape
+    /// whatever the device sent. A field that is not an array is not a list of
+    /// warnings: the answer carries none of them.
+    pub fn warnings(&self) -> Option<Vec<String>> {
+        let items = self.payload.get("warnings")?.as_array()?;
+        Some(items.iter().map(field_value).collect())
+    }
+
+    /// The product-specific data of an answer (§2.5.2).
+    ///
+    /// The field is free-form: the profile of the device decides what it
+    /// holds, so the value is kept as it is. A null field counts as an absent
+    /// one: the device sends the field it has no data for as null, and the
+    /// journal must not show "null" where there is nothing to show.
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.payload.get("data").filter(|value| !value.is_null())
+    }
+
     /// The code of an error (§2.5.3).
+    ///
+    /// The fields of an error lie in the payload itself (§2.5.3), but an ack
+    /// that was rejected carries them in a nested error object (§2.5.2): both
+    /// shapes are read.
     pub fn error_code(&self) -> Option<&str> {
-        self.payload.get("code").and_then(|value| value.as_str())
+        self.error_field("code").and_then(|value| value.as_str())
+    }
+
+    /// The severity of an error: "info", "warning", "error", "critical"
+    /// (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_severity(&self) -> Option<&str> {
+        self.error_field("severity")
+            .and_then(|value| value.as_str())
+    }
+
+    /// The human-readable text of an error (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_message(&self) -> Option<&str> {
+        self.error_field("message").and_then(|value| value.as_str())
+    }
+
+    /// Whether the command may be repeated (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_retryable(&self) -> Option<bool> {
+        self.error_field("retryable")
+            .and_then(|value| value.as_bool())
+    }
+
+    /// The additional data of an error (§2.5.3).
+    ///
+    /// The field is read like the code of the error: in the payload itself, or
+    /// in the nested error object of a rejected ack (§2.5.2).
+    pub fn error_details(&self) -> Option<&serde_json::Value> {
+        self.error_field("details")
+    }
+
+    /// A field of an error: in the payload itself, or in the nested error
+    /// object of a rejected ack (§2.5.2).
+    ///
+    /// A null field counts as an absent field: the device sends the fields it
+    /// has no value for as null, and such a field must neither shadow the
+    /// nested error object nor reach the journal as a value.
+    fn error_field(&self, name: &str) -> Option<&serde_json::Value> {
+        self.payload
+            .get(name)
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                self.error_object()
+                    .and_then(|error| error.get(name))
+                    .filter(|value| !value.is_null())
+            })
+    }
+
+    /// The nested error object of the payload (§2.5.2).
+    fn error_object(&self) -> Option<&serde_json::Value> {
+        self.payload.get("error").filter(|value| value.is_object())
     }
 }
 
@@ -1010,6 +1099,101 @@ mod tests {
         // The answer to a text that is not a command names no command.
         assert_eq!(envelope.msg_id, None);
         assert_eq!(envelope.correlation_id, None);
+    }
+
+    #[test]
+    fn the_error_fields_are_read_from_the_flat_payload() {
+        let text = br#"{"msg_type":"error","payload":{"code":"E_COMMAND_NOT_ALLOWED",
+            "severity":"error","message":"Command not allowed on UDP channel",
+            "retryable":false,"details":{"command":"rotate_local_secret"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_COMMAND_NOT_ALLOWED"));
+        assert_eq!(envelope.error_severity(), Some("error"));
+        assert_eq!(
+            envelope.error_message(),
+            Some("Command not allowed on UDP channel")
+        );
+        assert_eq!(envelope.error_retryable(), Some(false));
+        assert_eq!(
+            envelope
+                .error_details()
+                .and_then(|d| d.get("command"))
+                .and_then(|c| c.as_str()),
+            Some("rotate_local_secret")
+        );
+    }
+
+    #[test]
+    fn the_error_fields_are_read_from_the_nested_error_object() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"rejected",
+            "error":{"code":"E_POWER_LIMIT","severity":"warning",
+            "message":"too hot","retryable":true}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_POWER_LIMIT"));
+        assert_eq!(envelope.error_severity(), Some("warning"));
+        assert_eq!(envelope.error_message(), Some("too hot"));
+        assert_eq!(envelope.error_retryable(), Some(true));
+    }
+
+    #[test]
+    fn the_ack_fields_are_read() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"applied","device_state":"unknown",
+            "warnings":[],"data":{"bowls":1}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.result(), Some("applied"));
+        assert_eq!(envelope.device_state(), Some("unknown"));
+        assert_eq!(envelope.warnings(), Some(vec![]));
+        assert_eq!(
+            envelope
+                .data()
+                .and_then(|d| d.get("bowls"))
+                .and_then(|b| b.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_flat_error_field_wins_over_the_nested_one() {
+        // The payload carries both shapes: the flat field is the answer, the
+        // nested object only fills the fields the payload does not carry.
+        let text = br#"{"msg_type":"error","payload":{"code":"E_FLAT",
+            "error":{"code":"E_NESTED","severity":"warning"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(envelope.error_code(), Some("E_FLAT"));
+        assert_eq!(envelope.error_severity(), Some("warning"));
+    }
+
+    #[test]
+    fn a_null_field_is_read_as_absent() {
+        // A null field counts as an absent field: it must not shadow the
+        // nested error object and must not reach the journal as a value.
+        let text = br#"{"msg_type":"error","payload":{"code":null,"message":null,
+            "details":null,"data":null,"error":{"code":"E_NESTED"}}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        // The flat code is null, so the lookup falls through to the nested one.
+        assert_eq!(envelope.error_code(), Some("E_NESTED"));
+        // A null field carries no value.
+        assert_eq!(envelope.error_message(), None);
+        assert_eq!(envelope.error_severity(), None);
+        // The details are absent, not "null".
+        assert_eq!(envelope.error_details(), None);
+        // The data are absent, not "null".
+        assert_eq!(envelope.data(), None);
+    }
+
+    #[test]
+    fn a_warning_that_is_not_a_string_comes_as_compact_json() {
+        let text = br#"{"msg_type":"ack","payload":{"result":"applied",
+            "warnings":["hot",3,{"code":1}]}}"#;
+        let envelope = Envelope::parse(text).expect("the text is an envelope");
+        assert_eq!(
+            envelope.warnings(),
+            Some(vec![
+                "hot".to_string(),
+                "3".to_string(),
+                r#"{"code":1}"#.to_string(),
+            ])
+        );
     }
 
     #[test]

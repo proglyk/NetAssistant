@@ -217,24 +217,24 @@ fn close_reason_text(reason: &str) -> String {
 fn reply_text(reply: &CommandReply) -> String {
     let command = reply.command.as_ref().map(command_label);
     match (&reply.outcome, command) {
-        (ReplyOutcome::Ack { result }, Some(command)) => t!(
+        (ReplyOutcome::Ack { result, .. }, Some(command)) => t!(
             "udp_session.reply_ack_command",
             command = command.as_str(),
             result = result.as_deref().unwrap_or(EMPTY_VALUE)
         )
         .to_string(),
-        (ReplyOutcome::Ack { result }, None) => t!(
+        (ReplyOutcome::Ack { result, .. }, None) => t!(
             "udp_session.reply_ack",
             result = result.as_deref().unwrap_or(EMPTY_VALUE)
         )
         .to_string(),
-        (ReplyOutcome::Error { code }, Some(command)) => t!(
+        (ReplyOutcome::Error { code, .. }, Some(command)) => t!(
             "udp_session.reply_error_command",
             command = command.as_str(),
             code = code.as_deref().unwrap_or(EMPTY_VALUE)
         )
         .to_string(),
-        (ReplyOutcome::Error { code }, None) => t!(
+        (ReplyOutcome::Error { code, .. }, None) => t!(
             "udp_session.reply_error",
             code = code.as_deref().unwrap_or(EMPTY_VALUE)
         )

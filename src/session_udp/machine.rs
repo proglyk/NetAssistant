@@ -99,11 +99,25 @@ pub enum ReplyOutcome {
     Ack {
         /// The result of the answer.
         result: Option<String>,
+        /// The state of the device after the command.
+        device_state: Option<String>,
+        /// The warnings of the answer.
+        warnings: Option<Vec<String>>,
+        /// The product-specific data of the answer, as compact JSON.
+        data: Option<String>,
     },
     /// The device refused the command: "E_INVALID_CMD", ...
     Error {
         /// The code of the error.
         code: Option<String>,
+        /// The severity of the error: "info", "warning", "error", "critical".
+        severity: Option<String>,
+        /// The human-readable text of the error.
+        message: Option<String>,
+        /// Whether the command may be repeated.
+        retryable: Option<bool>,
+        /// The additional data of the error, as compact JSON.
+        details: Option<String>,
     },
 }
 
@@ -618,9 +632,16 @@ impl Machine {
         let outcome = match envelope.msg_type.as_str() {
             MSG_TYPE_ACK => ReplyOutcome::Ack {
                 result: envelope.result().map(str::to_string),
+                device_state: envelope.device_state().map(str::to_string),
+                warnings: envelope.warnings(),
+                data: envelope.data().map(|value| value.to_string()),
             },
             MSG_TYPE_ERROR => ReplyOutcome::Error {
                 code: envelope.error_code().map(str::to_string),
+                severity: envelope.error_severity().map(str::to_string),
+                message: envelope.error_message().map(str::to_string),
+                retryable: envelope.error_retryable(),
+                details: envelope.error_details().map(|value| value.to_string()),
             },
             _ => return None,
         };
@@ -643,7 +664,7 @@ impl Machine {
         let index = pending.iter().position(|known| known.msg_id == msg_id)?;
         let terminal = match outcome {
             ReplyOutcome::Error { .. } => true,
-            ReplyOutcome::Ack { result } => result
+            ReplyOutcome::Ack { result, .. } => result
                 .as_deref()
                 .is_some_and(|result| TERMINAL_RESULTS.contains(&result)),
         };
@@ -1712,7 +1733,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Reply(CommandReply {
-                outcome: ReplyOutcome::Ack { result: Some(result) },
+                outcome: ReplyOutcome::Ack { result: Some(result), .. },
                 command: None,
             }) if result.as_str() == "applied"
         )));
@@ -1728,7 +1749,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Reply(CommandReply {
-                outcome: ReplyOutcome::Error { code: Some(code) },
+                outcome: ReplyOutcome::Error { code: Some(code), .. },
                 command: None,
             }) if code.as_str() == "E_INVALID_CMD"
         )));
@@ -2073,5 +2094,73 @@ mod tests {
                 command: None,
             })
         )));
+    }
+
+    #[test]
+    fn the_reply_carries_the_fields_of_the_answer() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(send_command("get_status"), NOW);
+        let plain =
+            br#"{"msg_type":"error","correlation_id":"550e8400-e29b-41d4-a716-446655440000",
+            "payload":{"code":"E_COMMAND_NOT_ALLOWED","severity":"error",
+            "message":"Command not allowed on UDP channel","retryable":false,
+            "details":{"command":"rotate_local_secret"}}}"#;
+        let actions = m.handle(Command::Packet(device_data(1, plain)), NOW);
+        let reply = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Reply(reply) => Some(reply),
+                _ => None,
+            })
+            .expect("the frame carries a reply");
+        assert_eq!(
+            reply.outcome,
+            ReplyOutcome::Error {
+                code: Some("E_COMMAND_NOT_ALLOWED".to_string()),
+                severity: Some("error".to_string()),
+                message: Some("Command not allowed on UDP channel".to_string()),
+                retryable: Some(false),
+                details: Some(r#"{"command":"rotate_local_secret"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_ack_carries_the_fields_of_the_answer() {
+        let mut m = Machine::new();
+        establish(&mut m);
+        let _ = m.handle(send_command("get_status"), NOW);
+        let plain = serde_json::json!({
+            "msg_type": "ack",
+            "correlation_id": MSG_ID,
+            "payload": {
+                "result": "applied",
+                "device_state": "idle",
+                "warnings": ["hot", 3],
+                "data": {"bowls": 1}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let actions = m.handle(Command::Packet(device_data(1, &plain)), NOW);
+        let reply = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Reply(reply) => Some(reply),
+                _ => None,
+            })
+            .expect("the frame carries a reply");
+        // Every field of the answer keeps its own name: the result is not the
+        // state of the device, and the data is not the warnings.
+        assert_eq!(
+            reply.outcome,
+            ReplyOutcome::Ack {
+                result: Some("applied".to_string()),
+                device_state: Some("idle".to_string()),
+                warnings: Some(vec!["hot".to_string(), "3".to_string()]),
+                data: Some(r#"{"bowls":1}"#.to_string()),
+            }
+        );
     }
 }
